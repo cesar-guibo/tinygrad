@@ -3,7 +3,7 @@ import math
 from typing import Tuple, Optional
 from tinygrad.helpers import argsort
 from tinygrad.dtype import dtypes, DType, sum_acc_dtype
-from tinygrad.ops import ReduceOps, resolve, sint
+from tinygrad.ops import ReduceOps, resolve, sint, ScanOps
 from tinygrad.tensor import Function
 from tinygrad.engine.lazy import LazyBuffer
 
@@ -163,7 +163,16 @@ class Max(Function):
     # 1s in locations where the max was chosen (can be two locations)
     max_is_1s = self.x.ne(self.ret.expand(self.x.shape)).ne(self.x.const_like(1).cast(dtypes.bool)).cast(grad_output.dtype)
     div = max_is_1s.r(ReduceOps.SUM, self.axis).expand(self.x.shape)
-    return (max_is_1s/div) * grad_output.expand(self.x.shape)
+ 
+class Cumsum(Function):
+  def forward(self, x:LazyBuffer, axis:Tuple[int, ...]) -> LazyBuffer:
+    self.input_shape = x.shape
+    self.axis = axis
+    return x.associative_scan(ScanOps.CUM_SUM, axis)
+
+  def backward(self, grad_output:LazyBuffer) -> LazyBuffer:
+    flip_stride = tuple(-1 if i in self.axis else 1 for i in range(len(grad_output.shape)))
+    return grad_output.stride(flip_stride).associative_scan(ScanOps.CUM_SUM, self.axis).stride(flip_stride)
 
 # ************* movement ops *************
 

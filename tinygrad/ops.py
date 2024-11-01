@@ -32,6 +32,9 @@ class TernaryOps(FastEnum):
 class ReduceOps(FastEnum):
   """A -> B (reduce)"""
   SUM = auto(); PROD = auto(); MAX = auto() # noqa: E702
+class ScanOps(FastEnum):
+  """A -> B (associative scan)"""
+  CUM_SUM = auto() # noqa: E702
 class MetaOps(FastEnum):
   EMPTY = auto(); CONST = auto(); COPY = auto(); CONTIGUOUS = auto(); ASSIGN = auto(); VIEW = auto() # noqa: E702
 Op = Union[UnaryOps, BinaryOps, ReduceOps, MetaOps, TernaryOps]
@@ -119,6 +122,7 @@ class MathTrait(SimpleMathTrait):  # pylint: disable=abstract-method
 UNSAFE_PAD_OPS = {UnaryOps.RECIP, UnaryOps.LOG2, UnaryOps.EXP2, BinaryOps.IDIV}
 
 REDUCE_ALU: Dict[ReduceOps, BinaryOps] = {ReduceOps.SUM:BinaryOps.ADD, ReduceOps.PROD:BinaryOps.MUL, ReduceOps.MAX:BinaryOps.MAX}
+SCAN_ALU: Dict[ScanOps, BinaryOps] = {ScanOps.CUM_SUM:BinaryOps.ADD}
 
 # https://en.wikipedia.org/wiki/Identity_element
 def identity_element(op:BinaryOps, dt:DType): return dtypes.as_const({BinaryOps.ADD:0, BinaryOps.MUL:1, BinaryOps.MAX:dtypes.min(dt)}[op], dt)

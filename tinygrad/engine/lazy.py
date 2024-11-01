@@ -1,8 +1,8 @@
 from __future__ import annotations
 from typing import Union, Optional, Any, Tuple, List, get_args
 from tinygrad.dtype import dtypes, DType, ConstType, to_dtype, ImageDType
-from tinygrad.helpers import prod, getenv, all_int, all_same, DEBUG, _METADATA, Metadata, SPLIT_REDUCEOP, LAZYCACHE
-from tinygrad.ops import MetaOps, UnaryOps, BinaryOps, TernaryOps, ReduceOps, Op, exec_alu, python_alu, REDUCE_ALU
+from tinygrad.helpers import prod, getenv, all_int, all_same, DEBUG, _METADATA, Metadata, SPLIT_REDUCEOP, LAZYCACHE, SPLIT_SCANOP
+from tinygrad.ops import MetaOps, UnaryOps, BinaryOps, TernaryOps, ReduceOps, ScanOps, Op, exec_alu, python_alu, REDUCE_ALU, SCAN_ALU
 from tinygrad.ops import identity_element, MathTrait, resolve, UOp, sint
 from tinygrad.shape.shapetracker import ShapeTracker
 from tinygrad.device import Buffer
@@ -206,6 +206,45 @@ class LazyBuffer(MathTrait):
     splitted = self.reshape(splitted_shape).permute(tuple([x for x in range(len(splitted_shape)) if x != dim_to_split]+[dim_to_split]))
     if DEBUG >= 3: print(f"split {divisor}: {self.shape} -> {splitted.shape} -> {new_shape}")
     return splitted._reduce_op(op, axis)._reduce_op(op, (len(new_shape),)).reshape(new_shape)  # reduce original axes, then split
+
+  def _associative_scan_op(self, op:ScanOps, axis:Tuple[int, ...]) -> LazyBuffer:
+    assert all(0 <= x < len(self.shape) for x in axis), f"axis args {axis} out of range for shape {self.shape}"
+    axis = tuple(sorted([x for x in axis if resolve(self.shape[x] != 1)]))
+    if len(axis) == 0: return self
+    acc = self
+    for i in range(1, self.shape[axis[0]]):
+      aux = self.shrink(tuple((0, self.shape[i]) for i in range(axis[0])) + ((0, self.shape[axis[0]] - i),) + tuple((0, self.shape[i]) for i in range(axis[0] + 1, len(self.shape))))
+      aux = aux.pad(tuple((0, 0) for _ in range(axis[0])) + ((i, 0),) + tuple((0, 0) for i in range(axis[0] + 1, len(self.shape))))
+      acc = acc.alu(SCAN_ALU[op], aux)
+    return acc
+  def associative_scan(self, op:ScanOps, axis:int) -> LazyBuffer:
+    if 0 in self.shape: return self.const_with_shape(identity_element(SCAN_ALU[op], self.dtype), self.shape)
+    
+    # TODO: can we split symbolic shape if the reduce axis is not symbolic?
+    if not SPLIT_SCANOP or not all_int(self.shape) or (0 in self.shape):
+      return self._associative_scan_op(op, axis)
+    # if there are few globals, make some reduces into globals by splitting into two kernels
+    # cap output buffer to 2**22: heuristic number of global outputs to achieve max occupancy with enough locals+upcasts for gemm
+    #   ~2**10 should be enough if GROUP is used
+    # 256 split maximum should be "negligible reduce" for low prod(new_shape), 8 split minimum.
+    # split is moved to the end to provide maximum locality for the second phase reduce.
+    self_real_strides = self.st.real_strides(ignore_valid=True)
+    split_candidates = [(i, x) for i in axis for x in range(min(256,2**getenv("REDUCEOP_SPLIT_SIZE",22)//self.shape[i]),8-1,-1)
+                        if self.shape[i] % x == 0 and self_real_strides[i] != 0]
+    if not split_candidates: return self._associative_scan_op(op, axis)
+    dim_to_split, divisor = split_candidates[0]
+    splitted_shape = self.shape[:dim_to_split] + (divisor,) + (self.shape[dim_to_split]//divisor,) + self.shape[dim_to_split+1:]
+    splitted = self.reshape(splitted_shape).permute(tuple([x for x in range(len(splitted_shape)) if x != dim_to_split]+[dim_to_split]))
+    if DEBUG >= 3: print(f"split {divisor}: {self.shape} -> {splitted.shape} -> {self.shape}")
+    splitted_scans = splitted._associative_scan_op(op, axis)
+    prescan = splitted_scans.shrink(((splitted_scans.shape[0] - 1, splitted_scans.shape[0]),) + tuple((0, splitted_scans.shape[i]) for i in range(1, len(splitted_scans.shape))))
+    prescan = prescan._associative_scan_op(op, (len(prescan.shape) - 1,))
+    prescan = prescan.shrink(tuple((0, prescan.shape[i]) for i in range(len(prescan.shape) - 1)) + ((0, splitted_scans.shape[-1] - 1),))
+    prescan = prescan.pad(tuple((0, 0) for _ in range(len(self.shape))) + ((1, 0),))
+    prescan = prescan.expand(splitted_scans.shape)
+    return splitted_scans.alu(SCAN_ALU[op], prescan).permute(tuple([x for x in range(dim_to_split)] + [len(splitted_shape) - 1] + [x for x in range(dim_to_split, len(splitted_shape) - 1)])).reshape(self.shape)  # reduce original axes, then split
+
+
 
   # *** movement ops ***
 

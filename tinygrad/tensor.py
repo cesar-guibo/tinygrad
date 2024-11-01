@@ -602,7 +602,7 @@ class Tensor(SimpleMathTrait):  # pylint: disable=abstract-method
     dtype = kwargs.pop("dtype", dtypes.default_float if any(isinstance(x, float) for x in (start, stop, step)) else dtypes.default_int)
     # NOTE: this matches numpy, torch raises RuntimeError if stop-start and step have different signs
     if (output_len:=ceildiv(stop-start, step)) <= 0: return Tensor([], dtype=dtype, **kwargs)
-    return (Tensor.full((output_len,), step, dtype=dtype, **kwargs)._associative_scan_(F.Sum) + (start - step)).cast(dtype)
+    return (Tensor.full((output_len,), step, dtype=dtype, **kwargs).cumsum() + (start - step)).cast(dtype)
 
   @staticmethod
   def eye(n:int, m:Optional[int]=None, **kwargs) -> Tensor:
@@ -2121,26 +2121,12 @@ class Tensor(SimpleMathTrait):  # pylint: disable=abstract-method
     """
     return x.dot(self, acc_dtype=acc_dtype) if reverse else self.dot(x, acc_dtype=acc_dtype)
 
-  def _associative_scan_(self, fxn:Type[Function], axis:int=0, _first_identity:bool=False, identity:ConstType=0) -> Tensor:
-    assert self.shape[axis] != 0.0
-    pl_sz = self.shape[axis] - int(not _first_identity)
-    ret = self.transpose(axis,-1).pad2d((pl_sz,-int(_first_identity)), identity)._pool((self.shape[axis],))
-    ret = ret.cast(sum_acc_dtype(ret.dtype)) if isinstance(fxn, F.Sum) else ret.cast(self.dtype)
-    ret = ret._reduce(fxn, -1, False)
-    if isinstance(fxn, F.Sum) and self.dtype in (dtypes.float16, dtypes.bfloat16): ret = ret.cast(self.dtype)
-    return ret.transpose(axis,-1)
-  def _associative_scan(self, fxn:Type[Function], axis:int=0, identity:ConstType=0) -> Tensor:
-    axis = self._resolve_dim(axis)
-    if self.ndim == 0 or 0 in self.shape: return self
-    # TODO: someday the optimizer will find this on it's own
-    # for now this is a two stage cumsum
-    SPLIT = 256
-    if not isinstance(s:=self.shape[axis], int) or s <= SPLIT*2: return self._associative_scan_(fxn, axis, identity=identity)
-    ret = self.transpose(axis,-1).pad2d((round_up(s, SPLIT)-s, 0), identity).unflatten(-1, (-1, SPLIT))._associative_scan_(fxn, -1, identity=identity)
-    base_add = ret[..., -1]._associative_scan_(fxn, -1, _first_identity=True, identity=identity)
-    base_add = base_add.unsqueeze(-1).expand(*base_add.shape, ret.shape[-1])
-    def fix(x:Tensor): return x.flatten(start_dim=-2)[..., -s:].transpose(axis,-1)
-    return Tensor.stack(fix(ret), fix(base_add))._reduce(fxn, 0, False)
+  def _associative_scan(self, fxn:Type[Function], axis:int=0) -> Tensor:
+    if self.ndim == 0:
+      if axis is not None and any(a not in [-1, 0] for a in fully_flatten([axis])): raise IndexError(f"{axis=} out of range of [-1, 0]")
+      axis = ()
+    axis = tuple(self._resolve_dim(x) for x in (range(self.ndim) if axis is None else make_tuple(axis, 1)))
+    return fxn.apply(self, axis=axis)
 
   def cumsum(self, axis:int=0) -> Tensor:
     """
@@ -2156,7 +2142,8 @@ class Tensor(SimpleMathTrait):  # pylint: disable=abstract-method
     print(t.cumsum(1).numpy())
     ```
     """
-    return self._associative_scan(F.Sum, axis)
+    ret = self.cast(sum_acc_dtype(self.dtype))._associative_scan(F.Cumsum, axis)
+    return ret.cast(self.dtype) if self.dtype in (dtypes.float16, dtypes.bfloat16) else ret
 
   @staticmethod
   def _tri(r:sint, c:sint, diagonal:int=0, **kwargs) -> Tensor:
