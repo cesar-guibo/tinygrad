@@ -12,8 +12,9 @@ from tinygrad import Tensor
 #    print(item)
 #    print()
 
-a = Tensor([[i for i in range(100)] for _ in range(50000)], device="GPU")
+a = Tensor([[i for i in range(100)] for _ in range(5000)], device="GPU")
+b = Tensor([[i] for i in range(50000)], device="GPU")
 
-print((a.sum(axis=0)).numpy())
-
-print((a + a.flip(1)).numpy())
+#print((a + b.expand(a.shape)).numpy())
+#print((a.sum(axis=0)).numpy())
+print((a.cumsum(axis=0)).numpy())

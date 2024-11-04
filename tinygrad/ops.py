@@ -152,6 +152,8 @@ class UOps(FastEnum):
   NOOP = auto()
   REDUCE = auto()
   REDUCE_AXIS = auto()
+  SCAN = auto()
+  SCAN_AXIS = auto()
 
   # helper ops
   GEP = auto()
@@ -187,7 +189,7 @@ class UOps(FastEnum):
   VCONST = auto()
   CONST = auto()
 
-BUFFER_UOPS = {UOps.LOAD, UOps.PRELOAD, UOps.STORE, UOps.VALID}
+BUFFER_UOPS = {UOps.LOAD, UOps.PRELOAD, UOps.STORE, UOps.VALID, UOps.SCAN_AXIS, UOps.SCAN}
 COMMUTATIVE = {BinaryOps.ADD, BinaryOps.MUL, BinaryOps.MAX, BinaryOps.CMPNE, BinaryOps.XOR, BinaryOps.AND, BinaryOps.OR}
 END_FOR_UOP = {UOps.IF:(UOps.STORE, UOps.ENDIF), UOps.RANGE:(UOps.ASSIGN, UOps.ENDRANGE)}
 
@@ -281,6 +283,7 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
       return graph_rewrite(self, symbolic)
   def ssimplify(self) -> Union[UOp, ConstType]: return ret.arg if (ret:=self.simplify()).op is UOps.CONST else ret
   def _eval(self, dtype, expected_type:Type[T]) -> T:
+    print(self.dtype, dtype)
     assert self.dtype in dtype, f"eval with wrong dtype {self}"
     vmin, vmax = (simple_self:=self.simplify())._min_max
     if vmin != vmax: raise ValueError(f"eval failed to be a single number, range is {vmin} to {vmax} in {simple_self.render()}")
@@ -301,8 +304,8 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
     return ret.arg
   @property
   def axis_arg(self) -> Tuple[int, ...]:
-    assert self.op in {UOps.REDUCE_AXIS, UOps.WMMA}, f"axis_arg called on {self.op}"
-    ret = self.arg[1] if self.op is UOps.REDUCE_AXIS else self.arg[7]
+    assert self.op in {UOps.REDUCE_AXIS, UOps.SCAN_AXIS, UOps.WMMA}, f"axis_arg called on {self.op}"
+    ret = self.arg[1] if self.op in {UOps.REDUCE_AXIS, UOps.SCAN_AXIS} else self.arg[7]
     assert isinstance(ret, tuple) and all(isinstance(x, int) for x in ret), f"axis_arg trying to return {ret}"
     return ret
   def sink(self, *srcs:UOp): return UOp(UOps.SINK, dtypes.void, (self,)+srcs)
@@ -312,7 +315,7 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
   def broadcast(self, count:int):
     assert self.dtype.count == 1
     if count == 1: return self
-    return UOp(UOps.VECTORIZE, self.dtype.vec(count), (self,)*count)
+    return UOp(UOps.VECTORIZE, self.dtype.vec(count), (self,)*count, tuple())
   def cast(self, dtype:DType): return UOp(UOps.CAST, dtype, (self,))
   def bitcast(self, dtype:DType): return UOp(UOps.BITCAST, dtype, (self,))
   def gep(self, i:Union[Tuple[int, ...], int]):
@@ -345,6 +348,7 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
                                              UOp.const(dtype, end) if not isinstance(end, UOp) else end), arg=idx)
   def reduce(self, op:BinaryOps, *rng:UOp): return UOp(UOps.REDUCE, self.dtype, (self,) + rng, op)
   def r(self, op, axis): return UOp(UOps.REDUCE_AXIS, self.dtype, (self,), (REDUCE_ALU[op] if op in ReduceOps else op, axis))
+  def s(self, op, buf, view, axis): return UOp(UOps.SCAN_AXIS, self.dtype, (buf, view) + (self,), (SCAN_ALU[op] if op in ScanOps else op, axis))
 
   # *** uop Variable stuff ***
 
@@ -807,6 +811,7 @@ spec = PatternMatcher([
   (UPat(UOps.ENDIF, dtype=dtypes.void, src=(UPat(UOps.IF),)), lambda: True),
 
   (UPat(UOps.REDUCE_AXIS, name="x"), lambda x: isinstance(x.arg, tuple) and len(x.arg) == 2 and x.arg[0] in REDUCE_ALU.values()),
+  (UPat(UOps.SCAN_AXIS, name="x"), lambda x: isinstance(x.arg, tuple) and len(x.arg) == 2 and x.arg[0] in SCAN_ALU.values()),
   (UPat(UOps.GEP, src=(UPat(name="src"),), name="gep"), lambda gep,src: gep.dtype == src.dtype.scalar()),
   (UPat(UOps.VECTORIZE, name="x"), lambda x: len(x.src)>1 and len(x.src) == x.dtype.count and all(x.dtype == y.dtype.vec(len(x.src)) for y in x.src)),
   (UPat((UOps.BITCAST, UOps.CAST), src=(UPat(),), name="x"), lambda x: x.arg is None),

@@ -350,7 +350,7 @@ def do_expand(root:UOp):
         new_srcs.append(src.src[0].gep(tuple(lst)))
     else:
       # non-EXPAND input
-      if (root.op in {UOps.LOAD, UOps.STORE} and i == 0) or (root.op is UOps.REDUCE and i != 0):
+      if (root.op in {UOps.LOAD, UOps.STORE, UOps.SCAN} and i == 0) or (root.op in {UOps.REDUCE, UOps.SCAN} and i != 0):
         # for the first arg of LOAD/STORE and the RANGE args of REDUCE, just pass them through ignoring EXPANDS
         new_srcs.append(src)
       elif src.dtype.count > 1:
@@ -377,7 +377,6 @@ def do_reduce(root:UOp):
   if len(reduce_parented):
     acc = UOp(UOps.DEFINE_ACC, root.dtype,
               (root.const_like(identity_element(root.arg, root.dtype.scalar())),) + tuple(reduce_parented), (acc_number,))
-    print(acc)
     acc_number += 1
     ret = UOp(UOps.ASSIGN, root.dtype, (acc, acc.alu(root.arg, ret)))
   # for MAX, we can just ignore the unparented
@@ -385,10 +384,32 @@ def do_reduce(root:UOp):
     for r in reduce_unparented:ret = ret * (r.src[1]-r.src[0]).cast(ret.dtype.scalar()).broadcast(ret.dtype.count)
   return ret
 
+recurrence_number = 0
+def do_scan(root:UOp):
+  global recurrence_number
+  reduce_parented, reduce_unparented = partition(root.src[3:], lambda x: x in root.src[2].sparents)
+  ret = root.src[2]
+  if len(reduce_parented):
+    acc = UOp(UOps.DEFINE_ACC, ret.dtype,
+              (ret.const_like(identity_element(root.arg, ret.dtype)),) + tuple(reduce_parented), (recurrence_number,))
+    recurrence_number += 1
+    ret = UOp(UOps.ASSIGN, ret.dtype, (acc, root.src[2].alu(root.arg, acc.gep(ret.dtype.count-1).broadcast(ret.dtype.count))))
+    ret = UOp.store(*(root.src[:2] + (ret,)))
+    #return a
+    #ret = UOp(UOps.SCAN, root.dtype, root.src[:2] + (a,), root.arg)
+    #ret = UOp(UOps.ASSIGN, root.dtype, (acc, acc.alu(root.arg, ret)))
+  # for MAX, we can just ignore the unparented
+  if root.arg is BinaryOps.ADD:
+    for r in reduce_unparented:ret = ret * (r.src[1]-r.src[0]).cast(ret.dtype.scalar()).broadcast(ret.dtype.count)
+  #return UOp.store(*ret.src[:-1])
+  return ret
+
+
 def do_contract(con:UOp):
   ex = con.src[0]
   # CONTRACT without EXPAND repeats the element VECTORIZED
-  if ex.op is not UOps.EXPAND: return UOp(UOps.VECTORIZE, con.dtype, con.src*con.dtype.count)
+  if ex.op is not UOps.EXPAND:
+    return UOp(UOps.VECTORIZE, con.dtype, con.src*con.dtype.count)
   # CONTRACT may remove several axes from EXPAND
   assert con.dtype.count == prod([x[1] for x in con.arg]), "dtype is wrong"
   idxs = []
@@ -420,7 +441,7 @@ expander = PatternMatcher([
    lambda outer, inner: UOp(UOps.EXPAND, outer.dtype, (inner.src[0],), inner.arg+outer.arg)),
   # do expansion
   (UPat((UOps.ALU, UOps.CAST, UOps.BITCAST, UOps.GEP, UOps.WMMA, UOps.LOAD, UOps.STORE,
-         UOps.VECTORIZE, UOps.REDUCE, UOps.IF), name="root", custom_early_reject=set([(UOps.EXPAND, None)])), do_expand),
+         UOps.VECTORIZE, UOps.REDUCE, UOps.SCAN, UOps.IF), name="root", custom_early_reject=set([(UOps.EXPAND, None)])), do_expand),
   (UPat(UOps.CONTRACT, name="con"), do_contract),
   # remove EXPANDs from SINK
   (UPat(UOps.SINK, name="root"),
@@ -462,6 +483,7 @@ def delete_redundant_gates(root:UOp) -> Optional[UOp]:
 just_reduce = PatternMatcher([
   # do reduce
   (UPat(UOps.REDUCE, name="root"), do_reduce),
+  (UPat(UOps.SCAN, name="root"), do_scan),
 ])
 
 devectorize = PatternMatcher([

@@ -36,7 +36,7 @@ class Opt:
   def __repr__(self): return f"Opt(op={self.op}, axis={self.axis}, amt={self.amt})"
   def real_axis(self, k:Kernel):
     if self.axis is None: return -1
-    if self.op is OptOps.UNROLL: return k.first_reduce+self.axis
+    if self.op is OptOps.UNROLL: return min(k.first_reduce, k.first_scan)+self.axis
     if self.op in {OptOps.GROUP, OptOps.GROUPTOP}: return k.first_reduce+k.group_for_reduces+self.axis
     return self.axis
 
@@ -66,12 +66,14 @@ class Kernel:
     @functools.lru_cache(None)
     def ordered_parents(op:UOp) -> List[UOp]: return dedup([item for x in op.src for item in ordered_parents(x)] + [op])
     self.reduceops = dedup([x for x in ordered_parents(self.ast) if x.op is UOps.REDUCE_AXIS])
+    self.scanops = dedup([x for x in ordered_parents(self.ast) if x.op is UOps.SCAN_AXIS])
 
     self.vars: List[Variable] = self.ast.variables()
     self.bufs: List[UOp] = [x for x in self.ast.parents if x.op in BUFFER_UOPS]
 
     # get earlybufs, before any reduceops
     earlybufs: List[UOp] = [x for reduceop in self.reduceops for x in reduceop.parents if x.op in BUFFER_UOPS]
+    earlybufs += [x for scanop in self.scanops for x in scanop.parents if x.op in BUFFER_UOPS]
     self.full_buf_index: int = self.bufs.index(earlybufs[0]) if earlybufs else 0
     # NOTE: full_shape can be wrong if there's a tree of reduces
 
@@ -84,9 +86,18 @@ class Kernel:
       self.sts.append(uop_sts_map[x])
       self.sts.append(uop_sts_map[x.src[0]])
 
+    # add the shapetrackers for each scan
+    # we use this to track which axes are reduced in each scan
+    for x in self.scanops:
+      self.sts.append(uop_sts_map[x])
+      self.sts.append(uop_sts_map[x.src[1]])
+
+    self.first_scan = self.scanops[0].arg[1][0] if len(self.scanops) > 0 else self.shape_len
     # move all reduce axes to the end
     reduce = list(enumerate(zip(self.full_shape, self.output_shape)))
     permute = tuple([i for i,(s,n) in reduce if not resolve(s != n)] + [i for i,(s,n) in reduce if resolve(s != n)])
+    self.reshape_and_permute(None, permute)
+    permute = tuple([i for i in range(len(self.full_shape)) if i != self.first_scan] + ([self.first_scan] if self.first_scan != len(self.full_shape) else []))
     self.reshape_and_permute(None, permute)
 
     # parameters for optimization
@@ -103,7 +114,7 @@ class Kernel:
 
     # group simplifies
     self.simplify_ones()
-    self.simplify_merge_adjacent()
+    #self.simplify_merge_adjacent()
 
   def copy(self):
     ret = type(self).__new__(type(self))
@@ -204,6 +215,7 @@ class Kernel:
       if new_shape_fxn is not None: st = st.reshape(tuple(new_shape_fxn(st.shape)))
       if axis is not None: st = st.permute(tuple(axis))
       new_sts.append(st)
+    self.first_scan = axis[self.first_scan] if axis is not None and self.first_scan < len(axis) else self.first_scan
     self.sts = new_sts
 
   # drops the final dimension
@@ -309,6 +321,7 @@ class Kernel:
     if use_tensor_cores and self.reduceop is not None and self.reduceop.arg[0] is BinaryOps.ADD:
       for tc in self.opts.tensor_cores:
         tensor_core_opts = [self._create_tc_opts(reduceop, tc, axis, opt_level) for reduceop in self.reduceops]
+        tensor_core_opts += [self._create_tc_opts(scanop, tc, axis, opt_level) for scanop in self.scanops]
         # can only fuse reduces with the same tc options
         assert all_same(tensor_core_opts)
         if tensor_core_opts[0] is None: continue
@@ -358,7 +371,8 @@ class Kernel:
           # hand-coded TC opts
           for tc_dim in [tc_dim for tc_dim in [1,0] if tc_opts.axes_exist[tc_dim]]: # attempt to upcast M and N
             szs = [sz for sz in [5,4,3,2] if self.full_shape[tc_opts.axes[tc_dim]] % sz == 0]
-            if szs: self.apply_opt(Opt(OptOps.UPCAST, tc_opts.axes[tc_dim], szs[0]))
+            if szs:
+              self.apply_opt(Opt(OptOps.UPCAST, tc_opts.axes[tc_dim], szs[0]))
 
           if tc_opts.axes_exist[0] and (szs := [sz for sz in [4,2] if self.full_shape[tc_opts.axes[0]] % sz == 0]): # attempt to local N
             self.apply_opt(Opt(OptOps.LOCAL, tc_opts.axes[0], szs[0]))
@@ -398,8 +412,9 @@ class Kernel:
     if opt.op is OptOps.LOCAL:    # cyan
       check(self.opts.has_local, "target does not support local")
       check(axis < self.global_dims, "local is for globals")
-      self.shift_to(axis, amt, insert_before=self.first_reduce)
+      self.shift_to(axis, amt, insert_before=min(self.first_reduce, self.first_scan))
       self.local_dims += 1
+      self.first_scan += 1
     elif opt.op in {OptOps.GROUP, OptOps.GROUPTOP}:   # green
       check(self.opts.has_local and self.opts.has_shared, "target does not support local or shared mem")
       check(self.first_reduce + self.group_for_reduces <= axis < self.first_upcast, "must be reduce axis to group")
@@ -444,7 +459,7 @@ class Kernel:
       check(not self.vars, "does not work with symbolic shape")
       check(axis < self.first_upcast, "cannot pad upcasted")
       # ok to pad SUM if all parent ALU ops have f(0) = 0
-      if (r:=self.reduceop) is not None and self.first_reduce <= axis:
+      if (r:=self.reduceop) is not None and min(self.first_reduce, self.first_scan) <= axis:
         check(r.arg[0] is BinaryOps.ADD and not any(u.op is UOps.ALU and u.arg in UNSAFE_PAD_OPS for u in r.parents), "cannot pad UNSAFE_PAD_OPS")
       padded = False
       for i,st in enumerate(self.sts):
@@ -464,7 +479,7 @@ class Kernel:
     if isinstance(self.membufs[0].dtype, ImageDType):
       unit_stride_axes_mul_4 = [i for i in self.sts[0].unit_stride_axes(ignore_valid=True) if self.sts[0].shape[i]%4 == 0]
       assert unit_stride_axes_mul_4, f"needs a unit stride axis in {self.bufs[0]}"
-      if all(x < self.first_upcast for x in unit_stride_axes_mul_4) and unit_stride_axes_mul_4[0] not in self.upcast_in_mid_reduce_axes:
+      if all(x < min(self.first_reduce, self.first_scan) for x in unit_stride_axes_mul_4) and unit_stride_axes_mul_4[0] not in self.upcast_in_mid_reduce_axes:
         self.apply_opt(Opt(OptOps.UPCAST, unit_stride_axes_mul_4[0], 4))
     return self
 
@@ -479,9 +494,9 @@ class Kernel:
       st0, st1 = self.sts[self.bufs.index(mulop.src[0])], self.sts[self.bufs.index(mulop.src[1])]
       strides0, strides1 = st0.real_strides(), st1.real_strides()
       def has_expanded_axis(shape, strides): return any(resolve(s > 1) and not resolve(st != 0) for s,st in zip(shape,strides))
-      if strides0[self.first_reduce] == 1 and not (has_expanded_axis(st0.shape, strides0) and has_expanded_axis(st1.shape, strides1)):
+      if strides0[min(self.first_reduce, self.first_scan)] == 1 and not (has_expanded_axis(st0.shape, strides0) and has_expanded_axis(st1.shape, strides1)):
         for global_idx in range(self.global_dims):
-          if self.full_shape[self.first_reduce]%MV_THREADS_PER_ROW == 0 and self.full_shape[global_idx]%(MV_BLOCKSIZE*MV_ROWS_PER_THREAD) == 0:
+          if self.full_shape[min(self.first_reduce, self.first_scan)]%MV_THREADS_PER_ROW == 0 and self.full_shape[global_idx]%(MV_BLOCKSIZE*MV_ROWS_PER_THREAD) == 0:
             if DEBUG >= 3:
               print(f"MATVEC: {self.full_shape=} {self.first_reduce=} {strides0=} {MV_BLOCKSIZE=} {MV_THREADS_PER_ROW=} {MV_ROWS_PER_THREAD=}")
             if MV_THREADS_PER_ROW > 1: self.apply_opt(Opt(OptOps.GROUP, 0, MV_THREADS_PER_ROW))
@@ -489,19 +504,19 @@ class Kernel:
             if MV_ROWS_PER_THREAD > 1: self.apply_opt(Opt(OptOps.UPCAST, global_idx, MV_ROWS_PER_THREAD))
             return self
 
-    if self.opts.has_local and self.opts.has_shared and all_int(self.sts[0].shape[:self.first_reduce]):
+    if self.opts.has_local and self.opts.has_shared and all_int(self.sts[0].shape[:min(self.first_reduce, self.first_scan)]):
       # are we grouping? (requires local shape support)
-      if not self.float4_axis(0) and self.first_reduce <= 2 and self.first_reduce + 1 <= self.shape_len and prod(self.sts[0].shape[:self.first_reduce]) <= 2048:  # noqa: E501
+      if not self.float4_axis(0) and min(self.first_reduce, self.first_scan) <= 2 and self.first_reduce + 1 <= self.shape_len and prod(self.sts[0].shape[:self.first_reduce]) <= 2048:  # noqa: E501
         # TODO: use 1024 if it's allowed in a smarter way
-        for sz in ([256, 16] if prod(self.sts[0].shape[:self.first_reduce]) <= 32 else [16]):
-          if all(st.shape[self.first_reduce] % sz == 0 or st.shape[self.first_reduce] == 1 for st in self.sts):
+        for sz in ([256, 16] if prod(self.sts[0].shape[:min(self.first_reduce, self.first_scan)]) <= 32 else [16]):
+          if all(st.shape[min(self.first_reduce, self.first_scan)] % sz == 0 or st.shape[self.first_reduce] == 1 for st in self.sts):
             try: # may fail due to excessive smem usage
               self.apply_opt(Opt(OptOps.GROUPTOP, 0, sz))
               break
             except KernelOptError: pass
 
       # are we upcasting in mid reduce? (only for images)
-      if self.bufs[0].src[0].dtype.name.startswith('image') and not self.float4_axis(0) and self.group_for_reduces and self.first_reduce <= 2 and prod(self.sts[0].shape) > 1:  # noqa: E501
+      if self.bufs[0].src[0].dtype.name.startswith('image') and not self.float4_axis(0) and self.group_for_reduces and min(self.first_reduce, self.first_scan) <= 2 and prod(self.sts[0].shape) > 1:  # noqa: E501
         axes = self.sts[0].unit_stride_axes()
         assert len(axes) == 1, f"wrong number of stride 1 axis : {axes}"
         if self.sts[0].shape[axes[0]]%4 == 0:
@@ -513,10 +528,10 @@ class Kernel:
       if buf.src[0].dtype.__class__ is ImageDType:
         #assert len(unit_stride_axes_mul_4) >= 1, f"needs a unit stride axis in {self.bufs[buf_index]}"
         if len(unit_stride_axes_mul_4) and all(x < self.first_upcast for x in unit_stride_axes_mul_4) and unit_stride_axes_mul_4[0] not in self.upcast_in_mid_reduce_axes:  # noqa: E501
-          if unit_stride_axes_mul_4[0] < self.first_reduce:
+          if unit_stride_axes_mul_4[0] < min(self.first_reduce, self.first_scan):
             self.apply_opt(Opt(OptOps.UPCAST, unit_stride_axes_mul_4[0], 4))
           else:
-            self.apply_opt(Opt(OptOps.UNROLL, unit_stride_axes_mul_4[0]-self.first_reduce, 4))
+            self.apply_opt(Opt(OptOps.UNROLL, unit_stride_axes_mul_4[0]-min(self.first_reduce, self.first_scan), 4))
 
     # no more opt if we are grouping
     if self.group_for_reduces: return self
@@ -530,7 +545,7 @@ class Kernel:
     # this can be made much smarter
     to_upcast: List[int] = []
     # upcast leading axes first (hack-ish for winograd; we actually want to upcast masked axes with low stride first)
-    for axis in range(self.first_reduce):
+    for axis in range(min(self.first_reduce, self.first_scan)):
       # we might want to be able to split axes that are masked, or refuse to merge them in simplify_merge_adjacent
       # for now skip upcasting here if there is a symbolic axis
       if isinstance(self.full_shape[axis], int) and self.full_shape[axis] <= 7 and any(st.axis_is_masked(axis) for st in self.sts) and \
@@ -541,9 +556,9 @@ class Kernel:
 
     # potentially do more upcasts of non reduce axes based on a heuristic
     upcasted_axis = set()
-    while resolve(prod(self.sts[0].shape[:self.first_reduce]) >= 1024):
+    while resolve(prod(self.sts[0].shape[:min(self.first_reduce, self.first_scan)]) >= 1024):
       xb_choices = []
-      for axis, upcast_amount in itertools.product(range(self.first_reduce), [3,4]):   # consider all the non reduce axes, and a 3 or 4 reduce
+      for axis, upcast_amount in itertools.product(range(min(self.first_reduce, self.first_scan)), [3,4]):   # consider all the non reduce axes, and a 3 or 4 reduce
         # if we haven't upcasted it, it's not symbolic, it mods, and buffer has stride 0 on axis while having no stride 0 in the upcasted axis already
         if axis not in upcasted_axis and isinstance(self.full_shape[axis], int) and self.full_shape[axis]%upcast_amount == 0 and any(st.views[-1].strides[axis] == 0 and not any(x[1] == 0 for x in self.upcasted_axis(buf_index)) for buf_index, st in enumerate(self.sts)):  # noqa: E501
           xb_choices.append((sum(st.views[-1].strides[axis]>0 for st in self.sts), sum(st.views[-1].strides[axis] for st in self.sts), axis, upcast_amount))  # noqa: E501
@@ -555,16 +570,16 @@ class Kernel:
       else: break
 
     # if last dim is small(ish) and it's a reduce dim, upcast the reduce (loop unrolling). no simplify needed since it's just an upcast.
-    if self.first_reduce < self.first_upcast and (prod(self.full_shape[self.first_upcast:]) <= 4 or not any(r for _,_,r in self.upcasted_axis(self.full_buf_index))) and (self.upcasted == 0 or prod(self.full_shape[-self.upcasted:]) < 64):  # noqa: E501
+    if min(self.first_reduce, self.first_scan) < self.first_upcast and (prod(self.full_shape[self.first_upcast:]) <= 4 or not any(r for _,_,r in self.upcasted_axis(self.full_buf_index))) and (self.upcasted == 0 or prod(self.full_shape[-self.upcasted:]) < 64):  # noqa: E501
       if isinstance(s:=self.full_unupcasted_shape[-1], int) and s <= 32:  # NOTE: cannot loop unroll symbolic axis
-        self.apply_opt(Opt(OptOps.UNROLL, len(self.full_unupcasted_shape)-1-self.first_reduce, 0))
+        self.apply_opt(Opt(OptOps.UNROLL, len(self.full_unupcasted_shape)-1-min(self.first_reduce, self.first_scan), 0))
         # if it's small, upcast a second reduce dimension too
-        if self.first_reduce < self.first_upcast and s <= 3 and isinstance(s2:=self.full_unupcasted_shape[-1], int) and s2 <= 3:
-          self.apply_opt(Opt(OptOps.UNROLL, len(self.full_unupcasted_shape)-1-self.first_reduce, 0))
+        if min(self.first_reduce, self.first_scan) < self.first_upcast and s <= 3 and isinstance(s2:=self.full_unupcasted_shape[-1], int) and s2 <= 3:
+          self.apply_opt(Opt(OptOps.UNROLL, len(self.full_unupcasted_shape)-1-min(self.first_reduce, self.first_scan), 0))
       else:
         for splits in [4]:
           if self.full_unupcasted_shape[-1]%splits == 0:
-            self.apply_opt(Opt(OptOps.UNROLL, len(self.full_unupcasted_shape)-1-self.first_reduce, splits))
+            self.apply_opt(Opt(OptOps.UNROLL, len(self.full_unupcasted_shape)-1-min(self.first_reduce, self.first_scan), splits))
             break
 
     # if nothing at all is upcasted and it's easy to, do an upcast
@@ -580,7 +595,7 @@ class Kernel:
         self.apply_opt(Opt(OptOps.NOLOCALS))
       else:
         # prioritize making expand axes local
-        local_axis_ranking = [(any(self.sts[buf_index].views[-1].strides[axis] == 0 for buf_index in range(len(self.sts))), axis) for axis in range(len(self.full_shape[:self.first_reduce]))]  # noqa: E501
+        local_axis_ranking = [(any(self.sts[buf_index].views[-1].strides[axis] == 0 for buf_index in range(len(self.sts))), axis) for axis in range(len(self.full_shape[:min(self.first_reduce, self.first_scan)]))]  # noqa: E501
         to_local: List[Tuple[int, int]] = []
         for _, axis in sorted(local_axis_ranking, key=lambda x: (-x[0], -x[1])):
           local_size = prod(sz for _, sz in to_local)
@@ -617,18 +632,22 @@ class Kernel:
     @functools.lru_cache(None)
     def fixup_ast(op:UOp, apply_to_st=None) -> UOp:
       arg = op.arg
-      if op.op in BUFFER_UOPS:
+      if op.op in BUFFER_UOPS and op.op is not UOps.SCAN_AXIS:
         # for locals, we use the ShapeTracker that's in the srcs
         st = op.st_arg if op.src[0].op is UOps.DEFINE_LOCAL else self.sts[self.bufs.index(op)]
         st_uop = (st if apply_to_st is None else apply_to_st(st)).to_uop()
         if op.op is UOps.VALID: return op.replace(src=(st_uop,))
         if op.op is UOps.STORE: return op.replace(src=(op.src[0], st_uop, fixup_ast(op.src[2], apply_to_st)))
         return op.replace(src=(op.src[0], st_uop, *[fixup_ast(x, apply_to_st) for x in op.src[2:]]))
-      if op.op is UOps.REDUCE_AXIS:
-        reduce_idx = len(self.bufs) + self.reduceops.index(op)*2
+      if op.op in {UOps.REDUCE_AXIS, UOps.SCAN_AXIS}:
+        reduce_idx = len(self.bufs) + (self.reduceops if op.op is UOps.REDUCE_AXIS else self.scanops).index(op)*2
         alu_op: BinaryOps = op.arg[0]
-        axis = tuple(i for i in range(self.first_reduce+self.group_for_reduces, self.shape_len)
-                    if resolve(self.sts[reduce_idx].shape[i] != self.sts[reduce_idx+1].shape[i]))
+        if op.op is UOps.REDUCE_AXIS:
+          axis = tuple(i for i in range(self.first_reduce+self.group_for_reduces, self.shape_len)
+                      if resolve(self.sts[reduce_idx].shape[i] != self.sts[reduce_idx+1].shape[i]))
+        else:
+          axis = tuple(i for i in range(self.first_scan, self.shape_len))
+
         if op in self.bufs_for_tensor_core and (tc := self.tensor_core):
           rsrc = op.src[0]
           if rsrc.op is UOps.CAST: rsrc = rsrc.src[0]
@@ -668,7 +687,7 @@ class Kernel:
               # for TC=2, we can't do the shapetracker fixup
               srcs = [fixup_ast(rsrc.src[0]), fixup_ast(rsrc.src[1])]
             # MUL/SUM instead of WMMA
-            ret = UOp(UOps.REDUCE_AXIS, tc.dtype_out, (srcs[0].alu(BinaryOps.MUL, srcs[1]).cast(tc.dtype_out),), (alu_op, wmma_arg[-1]))
+            ret = UOp(op.op, tc.dtype_out, (srcs[0].alu(BinaryOps.MUL, srcs[1]).cast(tc.dtype_out),), (alu_op, wmma_arg[-1]))
           else:
             # real WMMA, use CONTRACT/EXPAND to get the vectorization right
             wmma_upcast_axes = wmma_arg[-2]
@@ -679,6 +698,10 @@ class Kernel:
               UOp.const(tc.dtype_out.vec(wmma_sz[2]), 0.0)), arg=wmma_arg)
             ret = UOp(UOps.EXPAND, tc.dtype_out, (wmma,), arg=wmma_upcast_axes[2])
           new_reduce_axes = tuple(i for i in axis if i-self.first_upcast not in [ax for ax, _ in tc.reduce_axes])
+          if op.op is UOps.SCAN_AXIS:
+            st = op.st_arg if op.src[0].op is UOps.DEFINE_LOCAL else self.sts[self.bufs.index(op)]
+            st_uop = (st if apply_to_st is None else apply_to_st(st)).to_uop()
+            return op.replace(src=(op.src[0], st_uop, *[fixup_ast(x, apply_to_st) for x in op.src[2:]]), arg=(alu_op, new_reduce_axes))
           return op.replace(src=(ret,), arg=(alu_op, new_reduce_axes)) if new_reduce_axes else ret
         if self.group_for_reduces:
           start = UOp(UOps.REDUCE_AXIS, op.dtype, (fixup_ast(op.src[0], apply_to_st),), arg=(alu_op, axis))
@@ -700,6 +723,10 @@ class Kernel:
         arg = (alu_op, axis)
       elif op.op is UOps.SINK:
         arg = KernelInfo(self.local_dims, self.upcasted, self.dont_use_locals)
+      if op.op is UOps.SCAN_AXIS:
+        st = op.st_arg if op.src[0].op is UOps.DEFINE_LOCAL else self.sts[self.bufs.index(op)]
+        st_uop = (st if apply_to_st is None else apply_to_st(st)).to_uop()
+        return op.replace(src=(op.src[0], st_uop, *[fixup_ast(x, apply_to_st) for x in op.src[2:]]), arg=arg)
       return op.replace(src=tuple(fixup_ast(x, apply_to_st) for x in op.src), arg=arg)
     # NOTE: rewrite with an empty PatternMatcher to dedup UOps
     return graph_rewrite(fixup_ast(self.ast), PatternMatcher([]))
@@ -716,7 +743,6 @@ class Kernel:
       print(modified_ast)
       print(self.applied_opts)
     verify_ast(modified_ast)
-
     self.uops:List[UOp] = linearize_uop(full_graph_rewrite(rewrite_shapetracker_with_index(modified_ast, self.opts), self.opts))
     if DEBUG >= 5: print_uops(self.uops)
     return self
@@ -760,7 +786,7 @@ def _assert_valid_uop(uop:UOp, st:ShapeTracker, sts:Dict[UOp, ShapeTracker]) -> 
   sts[uop] = st
 
 def verify_ast(ast:UOp) -> Dict[UOp, ShapeTracker]:
-  assert ast.op is UOps.SINK and all(x.op is UOps.STORE for x in ast.src), "must be SINK"
+  assert ast.op is UOps.SINK and all(x.op in {UOps.STORE, UOps.SCAN_AXIS} for x in ast.src), "must be SINK"
   assert all_same([x.st_arg.size for x in ast.src]), "outputs must be exactly the same size"
   sts: Dict[UOp, ShapeTracker] = {}
   for out in ast.src: _assert_valid_uop(out, out.st_arg, sts)
