@@ -238,8 +238,7 @@ def _add_realize(realizes:Dict[UOp, UOp], b:UOp, store:UOp, load:UOp) -> Optiona
   realizes[b] = store
   return UOp(UOps.LOAD, load.dtype, (b, load.st_arg.to_uop()))
 break_sched = PatternMatcher([
-  (UPat.load(b:=UPat.var("b"), UPat(), UPat.store(b, UPat(), UPat(), name="store"), name="load"), _add_realize),
-  (UPat.load(b:=UPat.var("b"), UPat(), UPat(UOps.SCAN_AXIS, src=(b, UPat(), UPat()), name="store"), name="load"), _add_realize),
+  (UPat.load(b:=UPat.var("b"), UPat(), UPat((UOps.STORE, UOps.SCAN_AXIS), src=(b, UPat(), UPat()), name="store"), name="load"), _add_realize),
 ])
 
 @track_rewrites(named=True)
@@ -255,7 +254,6 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
   assigned = {ubuf for x in assigns if (ubuf:=ctx.buf_uops.get(x.buffer)) is not None}
   small_graphs = [full_ast_rewrite(UOp.sink(*(realizes[ctx.buf_uops[b]] for b in stores)),
                                    ctx.var_vals, assigned, ctx.ubuf_metadata) for stores in store_groups]
-
   # do BFS
   prescheduled = [ScheduleItem(u, tuple(b for u in c.bufs if (b:=ctx.uop_bufs[u]).size != 0),
                            tuple(c.metadata), tuple(c.assign_preloads)) for u,c in small_graphs]

@@ -43,10 +43,10 @@ def fold_expanded(ex, buf):
           if new_src[1].divides(fold_length) is None: continue
           # for images, we rewrite the index. it must evenly divide 4 from the above check
           if is_image:
-            new_src[1] = UOp(UOps.VECTORIZE, dtypes.int.vec(2), ((new_src[1] // 4) % buf.dtype.shape[1], (new_src[1] // (4 * buf.dtype.shape[1]))))
+            new_src[1] = UOp(UOps.VECTORIZE, dtypes.int.vec(2), ((new_src[1] // 4) % buf.dtype.shape[1], (new_src[1] // (4 * buf.dtype.shape[1]))), tuple())
           # vectorize the store/loadconst
           if not is_load or len(new_src) >= 4:
-            new_src[2] = UOp(UOps.VECTORIZE, new_src[2].dtype.vec(fold_length), tuple(new_srcs[offsets[o+i]].src[2] for i in range(fold_length)))
+            new_src[2] = UOp(UOps.VECTORIZE, new_src[2].dtype.vec(fold_length), tuple(new_srcs[offsets[o+i]].src[2] for i in range(fold_length)), tuple())
           # generate the folded new_srcs
           if is_load:
             new_load = UOp(UOps.LOAD, load_1.dtype.vec(fold_length), tuple(new_src))
@@ -65,9 +65,9 @@ def fix_unfoldable_image_load(load:UOp, buf:UOp):
   id4 = load.src[1] % 4
   new_src = list(load.src)
   # TODO: copied logic from above
-  new_src[1] = UOp(UOps.VECTORIZE, dtypes.int.vec(2), ((load.src[1] // 4) % buf.dtype.shape[1], (load.src[1] // (4 * buf.dtype.shape[1]))))
+  new_src[1] = UOp(UOps.VECTORIZE, dtypes.int.vec(2), ((load.src[1] // 4) % buf.dtype.shape[1], (load.src[1] // (4 * buf.dtype.shape[1]))), tuple())
   if len(new_src) >= 4:
-    new_src[2] = UOp(UOps.VECTORIZE, new_src[2].dtype.vec(4), tuple(new_src[2] for _ in range(4)))
+    new_src[2] = UOp(UOps.VECTORIZE, new_src[2].dtype.vec(4), tuple(new_src[2] for _ in range(4)), tuple())
   vec_load = UOp(UOps.LOAD, load.dtype.vec(4), tuple(new_src))
   return functools.reduce(lambda ret, i: id4.ne(i).where(ret, vec_load.gep(i)), range(4), load.const_like(float('nan')))
 
@@ -176,7 +176,7 @@ def loop_collapse(compval, idx, multconst, rng:UOp, reduce, idx2=None, idx3=None
   if idx3 is not None: idx = idx + idx3
   if vec is not None:
     # idx, mval, loop_start, loop_end
-    def dvec(x): return UOp(UOps.VECTORIZE, x.dtype.vec(vec.dtype.count), src=(x,)*vec.dtype.count)
+    def dvec(x): return UOp(UOps.VECTORIZE, x.dtype.vec(vec.dtype.count), src=(x,)*vec.dtype.count, arg=tuple())
     idx, mval, loop_start, loop_end = dvec(idx), dvec(mval), dvec(loop_start), dvec(loop_end)
   if mval_arg > 0 and ne is not None:
     comprange = UOp.minimum(loop_end, UOp.maximum((idx-compval)//mval + (loop_end-loop_start), loop_start))
@@ -217,7 +217,7 @@ def no_vectorized_wmma(wmma:UOp):
     tsrcs.append([s.gep(tuple(range(grp, grp+ssz))) for grp in range(0, s.dtype.count, ssz)])
   wmmas = [UOp(UOps.WMMA, wmma.dtype.scalar().vec(out_sz), tsrc, wmma.arg) for tsrc in zip(*tsrcs)]
   wmma_ex = flatten([[e.gep(i) for i in range(out_sz)] for e in wmmas])
-  return UOp(UOps.VECTORIZE, wmma.dtype, tuple(wmma_ex))
+  return UOp(UOps.VECTORIZE, wmma.dtype, tuple(wmma_ex), tuple())
 
 # this is symbolic 2.0
 sym = symbolic_flat+PatternMatcher([
@@ -230,7 +230,7 @@ sym = symbolic_flat+PatternMatcher([
    lambda vec,x: x if x.dtype == vec.dtype and tuple(y.arg[0] for y in vec.src) == tuple(range(len(vec.src))) else None),
   # reorder ALU/VECTORIZE
   (UPat(UOps.ALU, src=(UPat(UOps.VECTORIZE, src=UPat(name='x')), UPat(UOps.VECTORIZE, src=UPat(name='y'))), name='alu'),
-   lambda x,y,alu: UOp(UOps.VECTORIZE, alu.dtype, (UOp(UOps.ALU, alu.dtype.scalar(), (x,y), alu.arg),)*alu.dtype.count)),
+   lambda x,y,alu: UOp(UOps.VECTORIZE, alu.dtype, (UOp(UOps.ALU, alu.dtype.scalar(), (x,y), alu.arg),)*alu.dtype.count, tuple())),
   # VECTORIZE of a single element is just that element
   (UPat(UOps.VECTORIZE, src=(UPat(name='x'),)), lambda x: x),
   # VECTORIZE void is SINK
@@ -240,7 +240,7 @@ sym = symbolic_flat+PatternMatcher([
   (UPat(UOps.GEP, src=(UPat(UOps.GEP, name='g2'),), name='g1'),
    lambda g1, g2: g2.src[0].gep(tuple(g2.arg[g1.arg[i]] for i in range(g1.dtype.count)))),
   (UPat(UOps.GEP, src=(UPat(UOps.VECTORIZE, name="vec"),), name="gep"),
-   lambda gep, vec: UOp(UOps.VECTORIZE, gep.dtype, tuple(vec.src[i] for i in gep.arg)) if len(gep.arg) > 1 else vec.src[gep.arg[0]]),
+   lambda gep, vec: UOp(UOps.VECTORIZE, gep.dtype, tuple(vec.src[i] for i in gep.arg), tuple()) if len(gep.arg) > 1 else vec.src[gep.arg[0]]),
   (UPat(UOps.GEP, src=(UPat.cvar("c", vec=False),), name="gep"), lambda gep, c: gep.const_like(c.arg)),
   (UPat(UOps.GEP, src=(UPat(UOps.VCONST, name="c"),), name="gep"), lambda gep, c: gep.const_like(tuple(c.arg[x] for x in gep.arg))),
   # push all GEPs through ALUs (fix arange stuff)
@@ -356,7 +356,7 @@ def do_expand(root:UOp):
       elif src.dtype.count > 1:
         # put any input dtype > 1 grouped together
         new_srcs.append(UOp(UOps.VECTORIZE,
-                            src.dtype.scalar().vec(expand_sz*src.dtype.count), tuple(src.gep(i) for i in range(src.dtype.count))*expand_sz))
+                            src.dtype.scalar().vec(expand_sz*src.dtype.count), tuple(src.gep(i) for i in range(src.dtype.count))*expand_sz, tuple()))
       else:
         # repeat the arg
         new_srcs.append(src.broadcast(expand_sz))
@@ -384,32 +384,27 @@ def do_reduce(root:UOp):
     for r in reduce_unparented:ret = ret * (r.src[1]-r.src[0]).cast(ret.dtype.scalar()).broadcast(ret.dtype.count)
   return ret
 
-recurrence_number = 0
 def do_scan(root:UOp):
-  global recurrence_number
+  global acc_number
   reduce_parented, reduce_unparented = partition(root.src[3:], lambda x: x in root.src[2].sparents)
-  ret = root.src[2]
+  store_addr = root.src[0]
+  store_idx = root.src[1]
+  src = root.src[2]
   if len(reduce_parented):
-    acc = UOp(UOps.DEFINE_ACC, ret.dtype,
-              (ret.const_like(identity_element(root.arg, ret.dtype)),) + tuple(reduce_parented), (recurrence_number,))
-    recurrence_number += 1
-    ret = UOp(UOps.ASSIGN, ret.dtype, (acc, root.src[2].alu(root.arg, acc.gep(ret.dtype.count-1).broadcast(ret.dtype.count))))
-    ret = UOp.store(*(root.src[:2] + (ret,)))
-    #return a
-    #ret = UOp(UOps.SCAN, root.dtype, root.src[:2] + (a,), root.arg)
-    #ret = UOp(UOps.ASSIGN, root.dtype, (acc, acc.alu(root.arg, ret)))
-  # for MAX, we can just ignore the unparented
-  if root.arg is BinaryOps.ADD:
-    for r in reduce_unparented:ret = ret * (r.src[1]-r.src[0]).cast(ret.dtype.scalar()).broadcast(ret.dtype.count)
-  #return UOp.store(*ret.src[:-1])
-  return ret
+    acc = UOp(UOps.DEFINE_ACC, src.dtype,
+              (src.const_like(identity_element(root.arg, src.dtype)),) + tuple(reduce_parented), (acc_number,))
+    acc_number += 1
+    src = UOp(UOps.ASSIGN, src.dtype, (acc, root.src[2].alu(root.arg, acc.gep(src.dtype.count-1).broadcast(src.dtype.count))))
+  if root.arg is BinaryOps.ADD and reduce_unparented:
+    src = src + (functools.reduce(operator.mul, reduce_unparented).cast(src.dtype.scalar()) * (src.gep(src.dtype.count - 1) if src.dtype.count > 1 else src)).broadcast(src.dtype.count)
+  return UOp.store(store_addr, store_idx, src)
 
 
 def do_contract(con:UOp):
   ex = con.src[0]
   # CONTRACT without EXPAND repeats the element VECTORIZED
   if ex.op is not UOps.EXPAND:
-    return UOp(UOps.VECTORIZE, con.dtype, con.src*con.dtype.count)
+    return UOp(UOps.VECTORIZE, con.dtype, con.src*con.dtype.count, tuple())
   # CONTRACT may remove several axes from EXPAND
   assert con.dtype.count == prod([x[1] for x in con.arg]), "dtype is wrong"
   idxs = []
@@ -420,7 +415,7 @@ def do_contract(con:UOp):
 def no_vectorized_alu(alu):
   if alu.dtype.count == 1: return None
   alus = tuple(UOp(alu.op, alu.dtype.scalar(), tuple(s.gep(i) for s in alu.src), alu.arg) for i in range(alu.dtype.count))
-  return UOp(UOps.VECTORIZE, alu.dtype, alus)
+  return UOp(UOps.VECTORIZE, alu.dtype, alus, tuple())
 
 def create_gate(root:UOp) -> Optional[UOp]:
   @functools.lru_cache(None)
@@ -464,13 +459,13 @@ def no_vectorized_load_store(ls:UOp):
   if ls.op is UOps.LOAD and idx.dtype.count != ls.dtype.count: return None
   if ls.op is UOps.STORE and idx.dtype.count != ls.src[2].dtype.count: return None
   tv = [UOp(ls.op, ls.dtype.scalar(), (ls.src[0],) + tuple(j.gep(i) for j in ls.src[1:])) for i in range(idx.dtype.count)]
-  return UOp(UOps.VECTORIZE, ls.dtype, tuple(tv))
+  return UOp(UOps.VECTORIZE, ls.dtype, tuple(tv), tuple())
 
 def no_vectorized_acc(acc:UOp):
   if acc.dtype.count == 1: return None
   alus = tuple(UOp(acc.op, acc.dtype.scalar(),
     tuple(s.gep(i) if j == 0 else s for j,s in enumerate(acc.src)), acc.arg+(i,)) for i in range(acc.dtype.count))
-  return UOp(UOps.VECTORIZE, acc.dtype, alus)
+  return UOp(UOps.VECTORIZE, acc.dtype, alus, tuple())
 
 def delete_redundant_gates(root:UOp) -> Optional[UOp]:
   @functools.lru_cache(None)
@@ -496,9 +491,9 @@ devectorize = PatternMatcher([
 
 reducer = PatternMatcher([
   (UPat(UOps.CONST, name='c'),
-   lambda c: UOp(UOps.VECTORIZE, c.dtype, (UOp.const(c.dtype.scalar(), c.arg),)*c.dtype.count) if c.dtype.count > 1 else None),
-  (UPat(UOps.VCONST, name='c'), lambda c: UOp(UOps.VECTORIZE, c.dtype, tuple(UOp.const(c.dtype.scalar(), x) for x in c.arg))),
-  (UPat(UOps.GEP, name='gep'), lambda gep: UOp(UOps.VECTORIZE, gep.dtype, tuple(gep.src[0].gep(x) for x in gep.arg)) if len(gep.arg) > 1 else None),
+   lambda c: UOp(UOps.VECTORIZE, c.dtype, (UOp.const(c.dtype.scalar(), c.arg),)*c.dtype.count, tuple()) if c.dtype.count > 1 else None),
+  (UPat(UOps.VCONST, name='c'), lambda c: UOp(UOps.VECTORIZE, c.dtype, tuple(UOp.const(c.dtype.scalar(), x) for x in c.arg), tuple())),
+  (UPat(UOps.GEP, name='gep'), lambda gep: UOp(UOps.VECTORIZE, gep.dtype, tuple(gep.src[0].gep(x) for x in gep.arg), tuple()) if len(gep.arg) > 1 else None),
   # delete_redundant_gates (after expand, is this still needed?)
   (UPat(UOps.STORE, name="root"), delete_redundant_gates),
   # late fixup of unfoldable image loads

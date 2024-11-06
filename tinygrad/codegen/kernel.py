@@ -98,6 +98,7 @@ class Kernel:
     permute = tuple([i for i,(s,n) in reduce if not resolve(s != n)] + [i for i,(s,n) in reduce if resolve(s != n)])
     self.reshape_and_permute(None, permute)
     permute = tuple([i for i in range(len(self.full_shape)) if i != self.first_scan] + ([self.first_scan] if self.first_scan != len(self.full_shape) else []))
+    self.first_scan = permute.index(self.first_scan) if permute is not None and self.first_scan < len(permute) else self.first_scan
     self.reshape_and_permute(None, permute)
 
     # parameters for optimization
@@ -136,7 +137,7 @@ class Kernel:
     return ret
 
   @property
-  def membufs(self) -> List[UOp]: return dedup([x.src[0] for x in self.bufs if x.op in {UOps.LOAD, UOps.STORE}])
+  def membufs(self) -> List[UOp]: return dedup([x.src[0] for x in self.bufs if x.op in {UOps.LOAD, UOps.STORE, UOps.SCAN_AXIS}])
 
   # TODO: these need more tests or it might silently be no-op
   def float4_axis(self, i:int): return [x-self.first_upcast for x in self.sts[i].unit_stride_axes() if x >= self.first_upcast and self.sts[i].shape[x]%4 == 0]  # noqa: E501
@@ -215,7 +216,6 @@ class Kernel:
       if new_shape_fxn is not None: st = st.reshape(tuple(new_shape_fxn(st.shape)))
       if axis is not None: st = st.permute(tuple(axis))
       new_sts.append(st)
-    self.first_scan = axis[self.first_scan] if axis is not None and self.first_scan < len(axis) else self.first_scan
     self.sts = new_sts
 
   # drops the final dimension
@@ -244,6 +244,7 @@ class Kernel:
     all_ones = [s==1 for s in self.full_shape]
     self.local_dims -= sum(all_ones[self.first_reduce-self.local_dims:self.first_reduce])
     self.upcasted -= sum(all_ones[self.first_upcast:]) # TODO: no necessary since upcasted axis can't be un-upcasted
+    self.first_scan -= sum(all_ones[:self.first_scan])
     self.reshape_and_permute(lambda shape: [x for i,x in enumerate(shape) if not all_ones[i]], None)
     return any(all_ones)
 
@@ -276,7 +277,7 @@ class Kernel:
         si, sti, last_st = s[i], st[i], ret[-1][1]
         can_merge.append((sti is not None) and ((sti != 0 and last_st == si*sti) or (sti == 0 and last_st == 0)))
       # more can merge than this
-      mergeable = all(can_merge) and i != self.first_reduce
+      mergeable = all(can_merge) and i != self.first_reduce and i != self.first_scan
       for j,(s,st) in enumerate(zip(shapes, strides)):
         if mergeable: rets[j][-1] = (rets[j][-1][0] * s[i], st[i])
         else: rets[j].append((s[i], st[i]))
@@ -429,7 +430,7 @@ class Kernel:
       #upcast_count = sum(x == y for x,y in zip(self.full_shape[-self.upcasted:], self.output_shape[-self.upcasted:])) if self.upcasted else 0
       #self.shift_to(axis, amt, insert_before=None if upcast_count == 0 else self.shape_len-upcast_count)
       if self.full_shape[axis] == amt and axis == self.first_reduce: self.local_dims += 1 # first_reduce will ++, so offset loss in simplify_ones
-      if self.full_shape[axis] == amt and axis < self.first_reduce+self.group_for_reduces: self.group_for_reduces -= 1 # fully unrolling a GROUP
+      if self.full_shape[axis] == amt and axis < self.first_reduce+self.group_for_reduces: self.group_for_reduces = max((self.group_for_reduces - 1, 0)) # fully unrolling a GROUP
       self.shift_to(axis, amt, insert_before=None)
       self.upcast()
     elif opt.op is OptOps.UPCAST:                     # yellow
@@ -703,7 +704,7 @@ class Kernel:
             st_uop = (st if apply_to_st is None else apply_to_st(st)).to_uop()
             return op.replace(src=(op.src[0], st_uop, *[fixup_ast(x, apply_to_st) for x in op.src[2:]]), arg=(alu_op, new_reduce_axes))
           return op.replace(src=(ret,), arg=(alu_op, new_reduce_axes)) if new_reduce_axes else ret
-        if self.group_for_reduces:
+        if self.group_for_reduces > 0:
           start = UOp(UOps.REDUCE_AXIS, op.dtype, (fixup_ast(op.src[0], apply_to_st),), arg=(alu_op, axis))
           second_axis = tuple(i for i in range(self.first_reduce, self.first_reduce+self.group_for_reduces) \
                       if self.sts[reduce_idx].shape[i] != self.sts[reduce_idx+1].shape[i])

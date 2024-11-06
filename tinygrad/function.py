@@ -163,6 +163,7 @@ class Max(Function):
     # 1s in locations where the max was chosen (can be two locations)
     max_is_1s = self.x.ne(self.ret.expand(self.x.shape)).ne(self.x.const_like(1).cast(dtypes.bool)).cast(grad_output.dtype)
     div = max_is_1s.r(ReduceOps.SUM, self.axis).expand(self.x.shape)
+    return (max_is_1s/div) * grad_output.expand(self.x.shape)
  
 class Cumsum(Function):
   def forward(self, x:LazyBuffer, axis:Tuple[int, ...]) -> LazyBuffer:

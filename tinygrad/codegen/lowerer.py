@@ -127,11 +127,12 @@ def lower_scan_axis(ctx: IndexContext, x: UOp):
   buf = x.src[0]
   view = x.src[1]
   ret = x.src[2]
+  print(x)
   if len(contract_axis:=flatten(x.arg for x in reduce_expand)):
     ret = UOp(UOps.CONTRACT, x.dtype.vec(prod(x[1] for x in contract_axis)), (ret,), tuple(contract_axis))
     aux = [functools.reduce(lambda x,y: x.alu(alu_op, y), [ret.gep(i) for i in range(j + 1)]) for j in range(ret.dtype.count)]
     ret = UOp(UOps.VECTORIZE, x.dtype.vec(prod(x[1] for x in contract_axis)), tuple(aux), tuple(contract_axis))
-  return lower_load_store(ctx, UOp(UOps.SCAN, x.dtype, (buf, view, ret,) + tuple(reduce_range), alu_op) if len(reduce_range) else ret)
+  return UOp(UOps.SCAN, x.dtype, (buf, view, ret,) + tuple(reduce_range), alu_op)
 
 def lower_load_store(ctx: IndexContext, x: UOp):
   idx, valid = x.st_arg.to_indexed_uops(ctx.ridxs if x.op is UOps.LOAD and x.src[0].op is UOps.DEFINE_LOCAL else ctx.idxs)
@@ -157,7 +158,7 @@ pm_lowerer = PatternMatcher([
   (UPat(UOps.SCAN_AXIS, name="x"), lower_scan_axis),
   (UPat(UOps.VALID, src=(UPat(UOps.VIEW),), name="x"), lambda ctx,x: x.st_arg.to_indexed_uops(ctx.idxs)[1]),
   # rewrite LOAD/STORE VIEW to LOAD/STORE with indexed
-  (UPat((UOps.LOAD, UOps.STORE), src=(UPat(), UPat(UOps.VIEW)), allow_any_len=True, name="x"), lower_load_store),
+  (UPat((UOps.LOAD, UOps.STORE, UOps.SCAN), src=(UPat(), UPat(UOps.VIEW)), allow_any_len=True, name="x"), lower_load_store),
 ])
 
 def rewrite_shapetracker_with_index(ast:UOp, opts:Renderer) -> UOp: return graph_rewrite(ast, pm_lowerer, ctx=get_index(ast, opts))
