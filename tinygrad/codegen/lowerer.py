@@ -127,7 +127,6 @@ def lower_scan_axis(ctx: IndexContext, x: UOp):
   buf = x.src[0]
   view = x.src[1]
   ret = x.src[2]
-  print(x)
   if len(contract_axis:=flatten(x.arg for x in reduce_expand)):
     ret = UOp(UOps.CONTRACT, x.dtype.vec(prod(x[1] for x in contract_axis)), (ret,), tuple(contract_axis))
     aux = [functools.reduce(lambda x,y: x.alu(alu_op, y), [ret.gep(i) for i in range(j + 1)]) for j in range(ret.dtype.count)]

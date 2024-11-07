@@ -413,9 +413,10 @@ class Kernel:
     if opt.op is OptOps.LOCAL:    # cyan
       check(self.opts.has_local, "target does not support local")
       check(axis < self.global_dims, "local is for globals")
-      self.shift_to(axis, amt, insert_before=min(self.first_reduce, self.first_scan))
-      self.local_dims += 1
-      self.first_scan += 1
+      if axis < self.first_scan:
+        self.shift_to(axis, amt, insert_before=min(self.first_reduce, self.first_scan))
+        self.local_dims += 1
+        self.first_scan += 1
     elif opt.op in {OptOps.GROUP, OptOps.GROUPTOP}:   # green
       check(self.opts.has_local and self.opts.has_shared, "target does not support local or shared mem")
       check(self.first_reduce + self.group_for_reduces <= axis < self.first_upcast, "must be reduce axis to group")

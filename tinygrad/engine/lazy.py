@@ -182,10 +182,10 @@ class LazyBuffer(MathTrait):
 
     # const folding
     # TODO: fold this for symbolic?
-    # if self.is_unrealized_unmasked_const() and all_int(self.shape):
-    #   if op is ReduceOps.SUM: return self.const_with_shape(self.base.arg * prod(self.shape[i] for i in axis), new_shape)
-    #   if op is ReduceOps.PROD: return self.const_with_shape(self.base.arg ** prod(self.shape[i] for i in axis), new_shape)
-    #   if op is ReduceOps.MAX: return self.const_with_shape(self.base.arg, new_shape)
+    if self.is_unrealized_unmasked_const() and all_int(self.shape):
+      if op is ReduceOps.SUM: return self.const_with_shape(self.base.arg * prod(self.shape[i] for i in axis), new_shape)
+      if op is ReduceOps.PROD: return self.const_with_shape(self.base.arg ** prod(self.shape[i] for i in axis), new_shape)
+      if op is ReduceOps.MAX: return self.const_with_shape(self.base.arg, new_shape)
 
     # TODO: can we split symbolic shape if the reduce axis is not symbolic?
     if not SPLIT_REDUCEOP or not all_int(self.shape) or (0 in self.shape) or \
@@ -207,7 +207,7 @@ class LazyBuffer(MathTrait):
     if DEBUG >= 3: print(f"split {divisor}: {self.shape} -> {splitted.shape} -> {new_shape}")
     return splitted._reduce_op(op, axis)._reduce_op(op, (len(new_shape),)).reshape(new_shape)  # reduce original axes, then split
 
-  def _associative_scan_op(self, op:ScanOps, axis:Tuple[int, ...], first_identity:bool=False) -> LazyBuffer:
+  def _associative_scan_op(self, op:ScanOps, axis:Tuple[int, ...]) -> LazyBuffer:
     assert all(0 <= x < len(self.shape) for x in axis), f"axis args {axis} out of range for shape {self.shape}"
     axis = tuple(sorted([x for x in axis if resolve(self.shape[x] != 1)]))
     if len(axis) == 0: return self
@@ -230,6 +230,7 @@ class LazyBuffer(MathTrait):
     if not split_candidates: return self._associative_scan_op(op, axis)
     dim_to_split, divisor = split_candidates[0]
     splitted_shape = self.shape[:dim_to_split] + (divisor,) + (self.shape[dim_to_split]//divisor,) + self.shape[dim_to_split+1:]
+    print(splitted_shape)
     splitted = self.reshape(splitted_shape).permute(tuple([x for x in range(len(splitted_shape)) if x != dim_to_split]+[dim_to_split]))
     if DEBUG >= 3: print(f"split {divisor}: {self.shape} -> {splitted.shape} -> {self.shape}")
     splitted_scans = splitted._associative_scan_op(op, axis)
@@ -238,7 +239,7 @@ class LazyBuffer(MathTrait):
     prescan = prescan.shrink(tuple((0, prescan.shape[i]) for i in range(len(prescan.shape) - 1)) + ((0, prescan.shape[-1] - 1),))
     prescan = prescan.pad(tuple((0, 0) for _ in range(len(self.shape))) + ((1, 0),))
     prescan = prescan.expand(splitted_scans.shape)
-    return splitted_scans.alu(SCAN_ALU[op], prescan).permute(tuple([x for x in range(dim_to_split)] + [len(splitted_shape) - 1] + [x for x in range(dim_to_split, len(splitted_shape) - 1)])).reshape(self.shape)  # reduce original axes, then split
+    return splitted_scans.alu(SCAN_ALU[op], prescan).permute(tuple([x for x in range(dim_to_split)] + [len(splitted_shape) - 1] + [x for x in range(dim_to_split, len(splitted_shape) - 1)])).reshape(self.shape).contiguous()  # reduce original axes, then split
 
 
 

@@ -285,6 +285,9 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
   # confirm everything was scheduled correctly
   if len(schedule) != (ps:=len(prescheduled)): raise RuntimeError(f"cycle detected in graph, prescheduled {ps} but only scheduled {len(schedule)}")
   if DEBUG >= 1 and len(schedule) >= 10: print(f"scheduled {len(schedule)} kernels")
+  for s in schedule:
+    print(s)
+    print()
   return schedule, ctx.var_vals
 
 def create_schedule(outs:List[LazyBuffer]) -> List[ScheduleItem]:
