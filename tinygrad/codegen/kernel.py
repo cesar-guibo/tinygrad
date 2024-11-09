@@ -90,14 +90,15 @@ class Kernel:
     # we use this to track which axes are reduced in each scan
     for x in self.scanops:
       self.sts.append(uop_sts_map[x])
-      self.sts.append(uop_sts_map[x.src[1]])
+      self.sts.append(uop_sts_map[x.src[0]])
 
     self.first_scan = self.scanops[0].arg[1][0] if len(self.scanops) > 0 else self.shape_len
     # move all reduce axes to the end
     reduce = list(enumerate(zip(self.full_shape, self.output_shape)))
     permute = tuple([i for i,(s,n) in reduce if not resolve(s != n)] + [i for i,(s,n) in reduce if resolve(s != n)])
     self.reshape_and_permute(None, permute)
-    permute = tuple([i for i in range(len(self.full_shape)) if i != self.first_scan] + ([self.first_scan] if self.first_scan != len(self.full_shape) else []))
+    scan_axis = {a for s in self.scanops for a in s.arg[1]}
+    permute = tuple([i for i in range(len(self.full_shape)) if i not in scan_axis] + list(scan_axis))
     self.first_scan = permute.index(self.first_scan) if permute is not None and self.first_scan < len(permute) else self.first_scan
     self.reshape_and_permute(None, permute)
 
@@ -115,7 +116,7 @@ class Kernel:
 
     # group simplifies
     self.simplify_ones()
-    #self.simplify_merge_adjacent()
+    self.simplify_merge_adjacent()
 
   def copy(self):
     ret = type(self).__new__(type(self))
@@ -270,6 +271,7 @@ class Kernel:
     # TODO: move this into shapetracker, with tests!
     # TODO: how does this work with multi-reduce?
     rets = [[(s[0], st[0])] for s,st in zip(shapes, strides)]
+    aux = -1
     for i in range(1, len(shapes[0])):
       can_merge = []
       for s,st,ret in zip(shapes, strides, rets):
@@ -279,8 +281,11 @@ class Kernel:
       # more can merge than this
       mergeable = all(can_merge) and i != self.first_reduce and i != self.first_scan
       for j,(s,st) in enumerate(zip(shapes, strides)):
-        if mergeable: rets[j][-1] = (rets[j][-1][0] * s[i], st[i])
+        if mergeable:
+          rets[j][-1] = (rets[j][-1][0] * s[i], st[i])
+          if j < self.first_scan: aux += 1
         else: rets[j].append((s[i], st[i]))
+    self.first_scan -= max((aux, 0))
 
     # do the reshapes
     for i,x in enumerate(rets[:len(self.sts)]): self.sts[i] = self.sts[i].reshape(tuple([y[0] for y in x]))
@@ -700,10 +705,6 @@ class Kernel:
               UOp.const(tc.dtype_out.vec(wmma_sz[2]), 0.0)), arg=wmma_arg)
             ret = UOp(UOps.EXPAND, tc.dtype_out, (wmma,), arg=wmma_upcast_axes[2])
           new_reduce_axes = tuple(i for i in axis if i-self.first_upcast not in [ax for ax, _ in tc.reduce_axes])
-          if op.op is UOps.SCAN_AXIS:
-            st = op.st_arg if op.src[0].op is UOps.DEFINE_LOCAL else self.sts[self.bufs.index(op)]
-            st_uop = (st if apply_to_st is None else apply_to_st(st)).to_uop()
-            return op.replace(src=(op.src[0], st_uop, *[fixup_ast(x, apply_to_st) for x in op.src[2:]]), arg=(alu_op, new_reduce_axes))
           return op.replace(src=(ret,), arg=(alu_op, new_reduce_axes)) if new_reduce_axes else ret
         if self.group_for_reduces > 0:
           start = UOp(UOps.REDUCE_AXIS, op.dtype, (fixup_ast(op.src[0], apply_to_st),), arg=(alu_op, axis))
@@ -725,10 +726,6 @@ class Kernel:
         arg = (alu_op, axis)
       elif op.op is UOps.SINK:
         arg = KernelInfo(self.local_dims, self.upcasted, self.dont_use_locals)
-      if op.op is UOps.SCAN_AXIS:
-        st = op.st_arg if op.src[0].op is UOps.DEFINE_LOCAL else self.sts[self.bufs.index(op)]
-        st_uop = (st if apply_to_st is None else apply_to_st(st)).to_uop()
-        return op.replace(src=(op.src[0], st_uop, *[fixup_ast(x, apply_to_st) for x in op.src[2:]]), arg=arg)
       return op.replace(src=tuple(fixup_ast(x, apply_to_st) for x in op.src), arg=arg)
     # NOTE: rewrite with an empty PatternMatcher to dedup UOps
     return graph_rewrite(fixup_ast(self.ast), PatternMatcher([]))
@@ -738,7 +735,6 @@ class Kernel:
   @track_rewrites()
   def linearize(self) -> Kernel:
     modified_ast = self.get_optimized_ast()
-
     if DEBUG >= 3:
       print(self.name)
       if getenv("RAWAST"): print(self.ast)
@@ -788,7 +784,7 @@ def _assert_valid_uop(uop:UOp, st:ShapeTracker, sts:Dict[UOp, ShapeTracker]) -> 
   sts[uop] = st
 
 def verify_ast(ast:UOp) -> Dict[UOp, ShapeTracker]:
-  assert ast.op is UOps.SINK and all(x.op in {UOps.STORE, UOps.SCAN_AXIS} for x in ast.src), "must be SINK"
+  assert ast.op is UOps.SINK and all(x.op in {UOps.STORE} for x in ast.src), "must be SINK"
   assert all_same([x.st_arg.size for x in ast.src]), "outputs must be exactly the same size"
   sts: Dict[UOp, ShapeTracker] = {}
   for out in ast.src: _assert_valid_uop(out, out.st_arg, sts)

@@ -120,18 +120,16 @@ def lower_reduce_axis(ctx: IndexContext, x: UOp):
   return UOp(UOps.REDUCE, x.dtype, (ret,) + tuple(reduce_range), alu_op) if len(reduce_range) else ret
 
 def lower_scan_axis(ctx: IndexContext, x: UOp):
-  # NOTE: always using ridxs is fine here
+  # NOTE: always using sidxs is fine here
   reduce_range, reduce_expand = partition([ctx.sidxs[i] for i in x.axis_arg], lambda y: y.op is UOps.RANGE)
   assert all(x.op is UOps.EXPAND for x in reduce_expand), f"not all EXPANDS in {reduce_expand} for {x.axis_arg}"
   alu_op: BinaryOps = x.arg[0]
-  buf = x.src[0]
-  view = x.src[1]
-  ret = x.src[2]
+  ret = x.src[0]
   if len(contract_axis:=flatten(x.arg for x in reduce_expand)):
     ret = UOp(UOps.CONTRACT, x.dtype.vec(prod(x[1] for x in contract_axis)), (ret,), tuple(contract_axis))
     aux = [functools.reduce(lambda x,y: x.alu(alu_op, y), [ret.gep(i) for i in range(j + 1)]) for j in range(ret.dtype.count)]
     ret = UOp(UOps.VECTORIZE, x.dtype.vec(prod(x[1] for x in contract_axis)), tuple(aux), tuple(contract_axis))
-  return UOp(UOps.SCAN, x.dtype, (buf, view, ret,) + tuple(reduce_range), alu_op)
+  return UOp(UOps.SCAN, ret.dtype, (ret,) + tuple(reduce_range), alu_op)
 
 def lower_load_store(ctx: IndexContext, x: UOp):
   idx, valid = x.st_arg.to_indexed_uops(ctx.ridxs if x.op is UOps.LOAD and x.src[0].op is UOps.DEFINE_LOCAL else ctx.idxs)
@@ -157,7 +155,7 @@ pm_lowerer = PatternMatcher([
   (UPat(UOps.SCAN_AXIS, name="x"), lower_scan_axis),
   (UPat(UOps.VALID, src=(UPat(UOps.VIEW),), name="x"), lambda ctx,x: x.st_arg.to_indexed_uops(ctx.idxs)[1]),
   # rewrite LOAD/STORE VIEW to LOAD/STORE with indexed
-  (UPat((UOps.LOAD, UOps.STORE, UOps.SCAN), src=(UPat(), UPat(UOps.VIEW)), allow_any_len=True, name="x"), lower_load_store),
+  (UPat((UOps.LOAD, UOps.STORE), src=(UPat(), UPat(UOps.VIEW)), allow_any_len=True, name="x"), lower_load_store),
 ])
 
 def rewrite_shapetracker_with_index(ast:UOp, opts:Renderer) -> UOp: return graph_rewrite(ast, pm_lowerer, ctx=get_index(ast, opts))

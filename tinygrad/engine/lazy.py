@@ -229,8 +229,8 @@ class LazyBuffer(MathTrait):
                         if self.shape[i] % x == 0 and self_real_strides[i] != 0]
     if not split_candidates: return self._associative_scan_op(op, axis)
     dim_to_split, divisor = split_candidates[0]
+    if divisor == self.shape[dim_to_split]: return self._associative_scan_op(op, axis)
     splitted_shape = self.shape[:dim_to_split] + (divisor,) + (self.shape[dim_to_split]//divisor,) + self.shape[dim_to_split+1:]
-    print(splitted_shape)
     splitted = self.reshape(splitted_shape).permute(tuple([x for x in range(len(splitted_shape)) if x != dim_to_split]+[dim_to_split]))
     if DEBUG >= 3: print(f"split {divisor}: {self.shape} -> {splitted.shape} -> {self.shape}")
     splitted_scans = splitted._associative_scan_op(op, axis)

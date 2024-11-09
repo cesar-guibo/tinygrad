@@ -189,7 +189,7 @@ class UOps(FastEnum):
   VCONST = auto()
   CONST = auto()
 
-BUFFER_UOPS = {UOps.LOAD, UOps.PRELOAD, UOps.STORE, UOps.VALID, UOps.SCAN_AXIS, UOps.SCAN}
+BUFFER_UOPS = {UOps.LOAD, UOps.PRELOAD, UOps.STORE, UOps.VALID}
 COMMUTATIVE = {BinaryOps.ADD, BinaryOps.MUL, BinaryOps.MAX, BinaryOps.CMPNE, BinaryOps.XOR, BinaryOps.AND, BinaryOps.OR}
 END_FOR_UOP = {UOps.IF:(UOps.STORE, UOps.ENDIF), UOps.RANGE:(UOps.ASSIGN, UOps.ENDRANGE)}
 
@@ -347,7 +347,7 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
                                              UOp.const(dtype, end) if not isinstance(end, UOp) else end), arg=idx)
   def reduce(self, op:BinaryOps, *rng:UOp): return UOp(UOps.REDUCE, self.dtype, (self,) + rng, op)
   def r(self, op, axis): return UOp(UOps.REDUCE_AXIS, self.dtype, (self,), (REDUCE_ALU[op] if op in ReduceOps else op, axis))
-  def s(self, op, buf, view, axis): return UOp(UOps.SCAN_AXIS, self.dtype, (buf, view) + (self,), (SCAN_ALU[op] if op in ScanOps else op, axis))
+  def s(self, op, axis): return UOp(UOps.SCAN_AXIS, self.dtype, (self,), (SCAN_ALU[op] if op in ScanOps else op, axis))
 
   # *** uop Variable stuff ***
 

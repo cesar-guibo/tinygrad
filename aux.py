@@ -10,11 +10,10 @@ from tinygrad.dtype import dtypes
 #    print(item)
 #    print()
 
-a = Tensor([512 - i for i in range(512)], device="GPU")
+a = Tensor([[i for i in range(100)] for _ in range(50000)], device="GPU")
 c = Tensor([i for i in range(50000)], device="GPU")
 b = Tensor([[i] for i in range(50000)], device="GPU")
 
-x = a.flip(axis=0).cumsum(axis=0).flip(axis=0)
-print(x.lazydata.lbs[0].st)
-print(x.numpy())
+#print((a.sum(axis=0)).numpy())
+print((a.cumsum(axis=0)).numpy())
 

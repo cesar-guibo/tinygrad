@@ -67,9 +67,7 @@ def to_uop(buf:LazyBuffer, realizes:Dict[UOp, UOp], ctx:ScheduleContext, cache:D
   # everything else needs sources
   src = tuple(to_uop(x, realizes, ctx, cache) for x in buf.srcs)
 
-  if buf.op in ScanOps:
-    cache[buf] = ret = UOp(UOps.LOAD, dtype, (ubuf, buf.st.to_uop(), src[0].s(buf.op, ubuf, buf.st.to_uop(), buf.arg)))
-    return ret
+  if buf.op in ScanOps: ret = src[0].s(buf.op, buf.arg)
   elif buf.op in ReduceOps: ret = src[0].r(buf.op, buf.arg)
   elif buf.op is MetaOps.CONTIGUOUS: ret = UOp(UOps.CONTIGUOUS, dtype, src)
   elif buf.op is MetaOps.ASSIGN: ret = UOp(UOps.ASSIGN, dtype, (ubuf, src[1]), buf.arg)
@@ -238,7 +236,7 @@ def _add_realize(realizes:Dict[UOp, UOp], b:UOp, store:UOp, load:UOp) -> Optiona
   realizes[b] = store
   return UOp(UOps.LOAD, load.dtype, (b, load.st_arg.to_uop()))
 break_sched = PatternMatcher([
-  (UPat.load(b:=UPat.var("b"), UPat(), UPat((UOps.STORE, UOps.SCAN_AXIS), src=(b, UPat(), UPat()), name="store"), name="load"), _add_realize),
+  (UPat.load(b:=UPat.var("b"), UPat(), UPat(UOps.STORE, src=(b, UPat(), UPat()), name="store"), name="load"), _add_realize),
 ])
 
 @track_rewrites(named=True)
@@ -285,9 +283,6 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
   # confirm everything was scheduled correctly
   if len(schedule) != (ps:=len(prescheduled)): raise RuntimeError(f"cycle detected in graph, prescheduled {ps} but only scheduled {len(schedule)}")
   if DEBUG >= 1 and len(schedule) >= 10: print(f"scheduled {len(schedule)} kernels")
-  for s in schedule:
-    print(s)
-    print()
   return schedule, ctx.var_vals
 
 def create_schedule(outs:List[LazyBuffer]) -> List[ScheduleItem]:

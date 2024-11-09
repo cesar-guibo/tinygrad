@@ -350,7 +350,7 @@ def do_expand(root:UOp):
         new_srcs.append(src.src[0].gep(tuple(lst)))
     else:
       # non-EXPAND input
-      if (root.op in {UOps.LOAD, UOps.STORE, UOps.SCAN} and i == 0) or (root.op in {UOps.REDUCE, UOps.SCAN} and i != 0):
+      if (root.op in {UOps.LOAD, UOps.STORE} and i == 0) or (root.op in {UOps.SCAN, UOps.REDUCE} and i != 0) or src.dtype.count == expand_sz:
         # for the first arg of LOAD/STORE and the RANGE args of REDUCE, just pass them through ignoring EXPANDS
         new_srcs.append(src)
       elif src.dtype.count > 1:
@@ -386,18 +386,16 @@ def do_reduce(root:UOp):
 
 def do_scan(root:UOp):
   global acc_number
-  reduce_parented, reduce_unparented = partition(root.src[3:], lambda x: x in root.src[2].sparents)
-  store_addr = root.src[0]
-  store_idx = root.src[1]
-  src = root.src[2]
+  reduce_parented, reduce_unparented = partition(root.src[1:], lambda x: x in root.src[0].sparents)
+  src = root.src[0]
   if len(reduce_parented):
     acc = UOp(UOps.DEFINE_ACC, src.dtype,
               (src.const_like(identity_element(root.arg, src.dtype)),) + tuple(reduce_parented), (acc_number,))
     acc_number += 1
-    src = UOp(UOps.ASSIGN, src.dtype, (acc, root.src[2].alu(root.arg, acc.gep(src.dtype.count-1).broadcast(src.dtype.count))))
+    src = UOp(UOps.ASSIGN, src.dtype, (acc, src.alu(root.arg, acc.gep(src.dtype.count-1).broadcast(src.dtype.count))))
   if root.arg is BinaryOps.ADD and reduce_unparented:
     src = src + (functools.reduce(operator.mul, reduce_unparented).cast(src.dtype.scalar()) * (src.gep(src.dtype.count - 1) if src.dtype.count > 1 else src)).broadcast(src.dtype.count)
-  return UOp.store(store_addr, store_idx, src)
+  return src
 
 
 def do_contract(con:UOp):
