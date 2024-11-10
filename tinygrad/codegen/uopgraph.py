@@ -45,14 +45,14 @@ def fold_expanded(ex, buf):
           if is_image:
             # for images, we rewrite the index. it must evenly divide 4 from the above check
             new_src[0] = buf.index(
-              UOp(Ops.VECTORIZE, dtypes.int.vec(2), ((oidx // 4) % buf.dtype.shape[1], (oidx // (4*buf.dtype.shape[1])))),
+              UOp(Ops.VECTORIZE, dtypes.int.vec(2), ((oidx // 4) % buf.dtype.shape[1], (oidx // (4*buf.dtype.shape[1]))), tuple()),
               rootsrc[0] if isinstance(rootsrc, tuple) else None)
           else:
             # for non image, we upcast the index pointer
             new_src[0] = new_src[0].cast(new_src[0].dtype.base.vec(fold_length).ptr(new_src[0].dtype.local))
           # vectorize the store
           if not is_load:
-            new_src[1] = UOp(Ops.VECTORIZE, new_src[1].dtype.vec(fold_length), tuple(new_srcs[offsets[o+i]].src[1] for i in range(fold_length)))
+            new_src[1] = UOp(Ops.VECTORIZE, new_src[1].dtype.vec(fold_length), tuple(new_srcs[offsets[o+i]].src[1] for i in range(fold_length)), tuple())
           # generate the folded new_srcs
           if is_load:
             new_load = UOp(Ops.LOAD, load_1.dtype.vec(fold_length), tuple(new_src))
@@ -72,7 +72,7 @@ def fix_unfoldable_image_load(load:UOp, buf:UOp):
   new_src = list(load.src)
   # TODO: copied logic from above
   new_src[0] = load.src[0].src[0].index(
-    UOp(Ops.VECTORIZE, dtypes.int.vec(2), ((oidx // 4) % buf.dtype.shape[1], (oidx // (4*buf.dtype.shape[1])))),
+    UOp(Ops.VECTORIZE, dtypes.int.vec(2), ((oidx // 4) % buf.dtype.shape[1], (oidx // (4*buf.dtype.shape[1]))), tuple()),
     load.src[0].src[2] if len(load.src[0].src) == 3 else None)
   vec_load = UOp(Ops.LOAD, load.dtype.vec(4), tuple(new_src))
   return functools.reduce(lambda ret, i: id4.ne(i).where(ret, vec_load.gep(i)), range(4), load.const_like(float('nan')))
@@ -176,7 +176,7 @@ def loop_collapse(compval, multconst, rng:UOp, acc:UOp, idx2=None,idx3=None,extr
     # add, mul, loop_start, loop_end
     def dvec(x:UOp):
       if x.op is Ops.CONST: return UOp.const(x.dtype.vec(vec.dtype.count), x.arg)
-      return UOp(Ops.VECTORIZE, x.dtype.vec(vec.dtype.count), src=(x,)*vec.dtype.count)
+      return UOp(Ops.VECTORIZE, x.dtype.vec(vec.dtype.count), src=(x,)*vec.dtype.count, arg=tuple())
     add, mul, loop_start, loop_end = dvec(add), dvec(mul), dvec(loop_start), dvec(loop_end)
   if mul.vmin > 0 and ne is not None:
     comprange = UOp.minimum(loop_end, UOp.maximum((add-compval)//mul + (loop_end-loop_start), loop_start))
@@ -220,15 +220,16 @@ def no_vectorized_wmma(wmma:UOp):
     tsrcs.append([s.gep(tuple(range(grp, grp+ssz))) for grp in range(0, s.dtype.count, ssz)])
   wmmas = [UOp(Ops.WMMA, wmma.dtype.scalar().vec(out_sz), tsrc, wmma.arg) for tsrc in zip(*tsrcs)]
   wmma_ex = flatten([[e.gep(i) for i in range(out_sz)] for e in wmmas])
-  return UOp(Ops.VECTORIZE, wmma.dtype, tuple(wmma_ex))
+  return UOp(Ops.VECTORIZE, wmma.dtype, tuple(wmma_ex), tuple())
 
-def reduce_collapse(acc:UOp, ret:UOp, alu:UOp):
-  reduce_parented, reduce_unparented = partition(acc.src[1:], lambda x: x in ret.sparents)
-  if len(reduce_unparented) == 0: return None
-  new_acc = acc.replace(src=acc.src[0:1]+tuple(reduce_parented))
+def scan_collapse(acc:UOp, ret:UOp, alu:UOp):
+  scan_parented, scan_unparented = partition(acc.src[1:], lambda x: x in ret.sparents)
+  if len(scan_unparented) == 0 or not acc.arg[1]: return None
+  print('\n', acc, ret, alu)
+  new_acc = acc.replace(src=acc.src[0:1]+tuple(scan_parented))
   ret = new_acc.assign(new_acc.alu(alu.op, ret))
   if alu.op is BinaryOps.ADD:
-    for r in reduce_unparented: ret = ret * (r.src[1]-r.src[0]).cast(ret.dtype.scalar()).broadcast(ret.dtype.count)
+    for r in scan_unparented: ret = ret * (r.src[1]-r.src[0]).cast(ret.dtype.scalar()).broadcast(ret.dtype.count)
   return ret
 
 acc_pat, rng_pat = UPat(Ops.DEFINE_ACC, name="acc"), UPat(Ops.RANGE, name="rng")
@@ -236,7 +237,7 @@ rng_aug = UPat.any(rng_pat, UPat.var("add")+rng_pat, UPat.var("mul")*rng_pat, UP
 
 index_load = UPat.var("buf").index(rng_aug).load(name="ld")
 
-arange_augrng = UPat.any(rng_aug, rng_aug+UPat.var("idx2"), rng_aug+UPat.var("idx2")+UPat.var("idx3"), UPat(Ops.VECTORIZE, name="vec", src=rng_aug))
+arange_augrng = UPat.any(rng_aug, rng_aug+UPat.var("idx2"), rng_aug+UPat.var("idx2")+UPat.var("idx3"), UPat(Ops.VECTORIZE, name="vec", src=rng_aug, arg=tuple()))
 arange_m = arange_augrng.lt(UPat.cvar("compval")).ne(UPat(Ops.CONST, name="ne", arg=True)).where(UPat.cvar("multconst"), UPat.const(None, 0))
 
 # this is symbolic 2.0
@@ -250,7 +251,7 @@ sym = symbolic_flat+PatternMatcher([
   (UPat(Ops.VECTORIZE, src=UPat(Ops.GEP, src=(UPat(name="x"),)), name="vec"), lambda vec,x: x.gep(tuple(y.arg[0] for y in vec.src))),
   # reorder ALU/VECTORIZE
   (UPat(GroupOp.ALU, src=(UPat(Ops.VECTORIZE, src=UPat(name='x')), UPat(Ops.VECTORIZE, src=UPat(name='y'))), name='alu'),
-   lambda x,y,alu: UOp(Ops.VECTORIZE, alu.dtype, (UOp(alu.op, alu.dtype.scalar(), (x,y)),)*alu.dtype.count)),
+   lambda x,y,alu: UOp(Ops.VECTORIZE, alu.dtype, (UOp(alu.op, alu.dtype.scalar(), (x,y)),)*alu.dtype.count, tuple())),
   # VECTORIZE of a single element is just that element
   (UPat(Ops.VECTORIZE, src=(UPat(name='x'),)), lambda x: x),
   # VECTORIZE void is SINK
@@ -260,7 +261,7 @@ sym = symbolic_flat+PatternMatcher([
   (UPat(Ops.GEP, src=(UPat(Ops.GEP, name='g2'),), name='g1'),
    lambda g1, g2: g2.src[0].gep(tuple(g2.arg[g1.arg[i]] for i in range(g1.dtype.count)))),
   (UPat(Ops.GEP, src=(UPat(Ops.VECTORIZE, name="vec"),), name="gep"),
-   lambda gep, vec: UOp(Ops.VECTORIZE, gep.dtype, tuple(vec.src[i] for i in gep.arg)) if len(gep.arg) > 1 else vec.src[gep.arg[0]]),
+   lambda gep, vec: UOp(Ops.VECTORIZE, gep.dtype, tuple(vec.src[i] for i in gep.arg), tuple()) if len(gep.arg) > 1 else vec.src[gep.arg[0]]),
   (UPat(Ops.GEP, src=(UPat.cvar("c", vec=False),), name="gep"), lambda gep, c: gep.const_like(c.arg)),
   (UPat(Ops.GEP, src=(UPat(Ops.VCONST, name="c"),), name="gep"), lambda gep, c: gep.const_like(tuple(c.arg[x] for x in gep.arg))),
   # push all GEPs through ALUs (fix arange stuff)
@@ -282,8 +283,8 @@ sym = symbolic_flat+PatternMatcher([
   (acc_pat.assign(UPat.var("idx").eq(UPat(Ops.RANGE, name="rng")).cast()*index_load+acc_pat), index_collapse),
   (acc_pat.assign(UPat.var("idx").eq(UPat(Ops.RANGE, name="rng")).where(index_load, UPat.const(None, 0.0))+acc_pat), index_collapse),
   # parentless reduce
-  (acc_pat.assign(UPat(Ops.ADD, src=[acc_pat, UPat.var("ret")], name="alu")), reduce_collapse),
-  (acc_pat.assign(UPat(Ops.MAX, src=[acc_pat, UPat.var("ret")], name="alu")), reduce_collapse),
+  (acc_pat.assign(UPat(Ops.ADD, src=[acc_pat, UPat.var("ret")], name="alu")), scan_collapse),
+  (acc_pat.assign(UPat(Ops.MAX, src=[acc_pat, UPat.var("ret")], name="alu")), scan_collapse),
   # ** self folding **
   (UPat(Ops.DEFINE_ACC, src=(UPat.var("x"),)), lambda x: x),            # a DEFINE_ACC without ranges is a CONST
   (UPat(Ops.ASSIGN, src=(UPat.cvar(),UPat.var("x"))), lambda x: x),     # an ASSIGN to a const is a NOOP
@@ -358,7 +359,7 @@ def do_expand(root:UOp):
       elif src.dtype.count > 1:
         # put any input dtype > 1 grouped together
         new_srcs.append(UOp(Ops.VECTORIZE,
-                            src.dtype.scalar().vec(expand_sz*src.dtype.count), tuple(src.gep(i) for i in range(src.dtype.count))*expand_sz))
+                            src.dtype.scalar().vec(expand_sz*src.dtype.count), tuple(src.gep(i) for i in range(src.dtype.count))*expand_sz, tuple()))
       else:
         # repeat the arg
         new_srcs.append(src.broadcast(expand_sz))
@@ -374,7 +375,7 @@ def do_expand(root:UOp):
 def do_contract(con:UOp):
   ex = con.src[0]
   # CONTRACT without EXPAND repeats the element VECTORIZED
-  if ex.op is not Ops.EXPAND: return UOp(Ops.VECTORIZE, con.dtype, con.src*con.dtype.count)
+  if ex.op is not Ops.EXPAND: return UOp(Ops.VECTORIZE, con.dtype, con.src*con.dtype.count, tuple())
   # CONTRACT may remove several axes from EXPAND
   assert con.dtype.count == prod([x[1] for x in con.arg]), "dtype is wrong"
   idxs = []
@@ -385,7 +386,7 @@ def do_contract(con:UOp):
 def no_vectorized_alu(alu):
   if alu.dtype.vcount == 1: return None
   alus = tuple(UOp(alu.op, alu.dtype.scalar(), tuple(s.gep(i) for s in alu.src), alu.arg) for i in range(alu.dtype.vcount))
-  return UOp(Ops.VECTORIZE, alu.dtype, alus)
+  return UOp(Ops.VECTORIZE, alu.dtype, alus, tuple())
 
 def create_gate(root:UOp) -> Optional[UOp]:
   @functools.lru_cache(None)
@@ -423,13 +424,13 @@ def no_vectorized_load_store(ls:UOp):
   assert isinstance(idx.dtype, PtrDType)
   if idx.dtype.v == 1: return None
   tv = [UOp(ls.op, ls.dtype.scalar(), tuple(j.gep(i) for j in ls.src)) for i in range(idx.dtype.v)]
-  return UOp(Ops.VECTORIZE, ls.dtype, tuple(tv))
+  return UOp(Ops.VECTORIZE, ls.dtype, tuple(tv), tuple())
 
 def no_vectorized_acc(acc:UOp):
   if acc.dtype.count == 1: return None
   alus = tuple(UOp(acc.op, acc.dtype.scalar(),
     tuple(s.gep(i) if j == 0 else s for j,s in enumerate(acc.src)), acc.arg+(i,)) for i in range(acc.dtype.count))
-  return UOp(Ops.VECTORIZE, acc.dtype, alus)
+  return UOp(Ops.VECTORIZE, acc.dtype, alus, tuple())
 
 devectorize = PatternMatcher([
   # no ALU on vectorized dtypes
@@ -469,9 +470,9 @@ def move_mask(x:UOp, buf:UOp, idx:UOp, mask:UOp, cast:Optional[UOp]=None) -> UOp
 pm_render = PatternMatcher([
   # for rendering, we use explicit VECTORIZE
   (UPat(Ops.CONST, name='c'),
-   lambda c: UOp(Ops.VECTORIZE, c.dtype, (UOp.const(c.dtype.scalar(), c.arg),)*c.dtype.vcount) if c.dtype.vcount > 1 else None),
-  (UPat(Ops.VCONST, name='c'), lambda c: UOp(Ops.VECTORIZE, c.dtype, tuple(UOp.const(c.dtype.scalar(), x) for x in c.arg))),
-  (UPat(Ops.GEP, name='gep'), lambda gep: UOp(Ops.VECTORIZE, gep.dtype, tuple(gep.src[0].gep(x) for x in gep.arg)) if len(gep.arg) > 1 else None),
+   lambda c: UOp(Ops.VECTORIZE, c.dtype, (UOp.const(c.dtype.scalar(), c.arg),)*c.dtype.vcount, tuple()) if c.dtype.vcount > 1 else None),
+  (UPat(Ops.VCONST, name='c'), lambda c: UOp(Ops.VECTORIZE, c.dtype, tuple(UOp.const(c.dtype.scalar(), x) for x in c.arg), tuple())),
+  (UPat(Ops.GEP, name='gep'), lambda gep: UOp(Ops.VECTORIZE, gep.dtype, tuple(gep.src[0].gep(x) for x in gep.arg), tuple()) if len(gep.arg) > 1 else None),
   (UPat(Ops.VECTORIZE, src=(UPat(name='x'),)), lambda x: x),
   # move masks of loads/stores
   (UPat((Ops.LOAD, Ops.STORE), src=(UPat.any(masked_index:=UPat(Ops.INDEX, src=(UPat(name="buf"), UPat(name="idx"), UPat(name="mask"))),

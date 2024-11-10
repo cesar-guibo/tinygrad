@@ -70,6 +70,7 @@ def to_uop(buf:LazyBuffer, ctx:ScheduleContext, children, allbufs, double_reduce
   # everything else needs sources
   src = tuple(to_uop(x, ctx, children, allbufs, double_reduces, cache) for x in buf.srcs)
   if buf.op in GroupOp.Reduce: ret = src[0].r(buf.op, buf.arg)
+  elif buf.op in GroupOp.Scan: ret = src[0].s(buf.op, buf.arg)
   elif buf.op is Ops.CONTIGUOUS: ret = UOp(Ops.CONTIGUOUS, dtype, src)
   elif buf.op is Ops.ASSIGN:
     ctx.assigns.add(b)
@@ -141,7 +142,7 @@ def push_swizzle_down_through_elementwise(root:UOp) -> Optional[UOp]:
 
 def merge_double_reduce(root:UOp, first_reduce:UOp) -> UOp:
   assert root.arg[0] == first_reduce.arg[0], "can't merge reduceops with different alu"
-  assert not any(x.op is Ops.REDUCE_AXIS for x in first_reduce.parents), "can't merge more than two reduceops at a time"
+  assert not any(x.op is Ops.SCAN_AXIS for x in first_reduce.parents), "can't merge more than two reduceops at a time"
   return first_reduce.src[0].r(first_reduce.arg[0], root.axis_arg+first_reduce.axis_arg)
 
 merge_views = PatternMatcher([(UPat(Ops.VIEW, src=(UPat(Ops.VIEW, name="s0"),), name="s1"), lambda s0,s1: s0.replace(arg=s0.st+s1.st))])
@@ -161,12 +162,12 @@ view_right = merge_views+PatternMatcher([
   (UPat(Ops.STORE, src=(UPat.var("b"), UPat.var("st"), UPat(Ops.ASSIGN, name="a"))),
    lambda a,b,st: UOp.store(b, (a.arg[0]+st.arg).to_uop(), a.replace(arg=())) if a.arg else None),
   # VIEW on a reduce creates a new VIEW
-  (UPat(Ops.VIEW, src=(UPat(Ops.REDUCE_AXIS, src=UPat.var("rsrc"), name="r"),), name="view"), view_r),
+  (UPat(Ops.VIEW, src=(UPat(Ops.SCAN_AXIS, src=UPat.var("rsrc"), name="r", arg=(UPat(), UPat(), True)),), name="view"), view_r),
   # push a VIEW down to STORE, through a reduce (ONLY reshapes)
-  (UPat(Ops.REDUCE_AXIS, src=(UPat(Ops.VIEW, name="swizzle"),), name="root"), push_swizzle_down_through_reduce),
+  (UPat(Ops.SCAN_AXIS, src=(UPat(Ops.VIEW, name="swizzle"),), arg=(UPat(), UPat(), True), name="root"), push_swizzle_down_through_reduce),
   # push VIEW(s) down to STORE, through an elementwise op (ONLY reshapes)
   (UPat((*GroupOp.ALU, Ops.CAST, Ops.BITCAST, Ops.ASSIGN, Ops.CONTIGUOUS, Ops.STORE), name="root"), push_swizzle_down_through_elementwise),
-  (UPat(Ops.REDUCE_AXIS, src=(UPat(Ops.REDUCE_AXIS, name="first_reduce"),), name="root"), merge_double_reduce),
+  (UPat(Ops.SCAN_AXIS, src=(UPat(Ops.SCAN_AXIS, name="first_scan", arg=(UPat(), UPat(), True)),), arg=(UPat(), UPat(), True), name="root"), merge_double_reduce),
 ])
 
 # ** ScheduleItem context builder

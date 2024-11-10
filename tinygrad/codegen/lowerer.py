@@ -48,23 +48,21 @@ def get_grouped_dims(prefix, dims:Tuple[sint, ...], max_sizes:Optional[Tuple[int
 @dataclass
 class IndexContext:
   idxs: List[UOp]
-  ridxs: List[UOp]
+  sidxs: List[UOp]
   acc_num: int = 0
 
 def get_index(ast:UOp, opts:Renderer) -> IndexContext:
   ki = ast.arg if isinstance(ast.arg, KernelInfo) else KernelInfo()
-  # NOTE: assumes the shape is <global dims> <local dims> <group_for_reduces> <reduces> <upcasts/unrolls>
+  # NOTE: assumes the shape is <global dims> <local dims> <group_for_scans> <scans> <upcasts/unrolls>
   full_shape = ast.full_shape
   first_upcasted = len(full_shape)-ki.upcasted
   first_output_st: ShapeTracker = ast.src[0].st_arg
-  # if there's no reduce, this is first_upcasted. assumes reduces are at the end
-  first_reduce = min([first_upcasted]+flatten(x.axis_arg for x in ast.sparents if x.op is Ops.REDUCE_AXIS))
+  # if there's no scan, this is first_upcasted. assumes scans are at the end
+  first_scan = ki.firs_scan
   local_loads = [x for x in ast.parents if x.op is Ops.LOAD and x.src[0].op is Ops.DEFINE_LOCAL]
-  # NOTE: sum up the reduced axes looking across all local loads, yields the number of grouped reduces
-  group_for_reduces = sum([any(j!=y for j in x) for x,y in zip(
-    [[l.st_arg.shape[i] for l in local_loads] for i in range(first_reduce,first_upcasted)],
-    first_output_st.shape[first_reduce:first_upcasted])]) if local_loads else 0
-  global_dims = first_reduce-ki.local_dims
+  # NOTE: sum up the scan axes looking across all local loads, yields the number of grouped scans
+  group_for_scans = ki.group_for_scans
+  global_dims = first_scan-ki.local_dims
 
   if opts.has_local:
     if ki.dont_use_locals:
@@ -73,47 +71,52 @@ def get_index(ast:UOp, opts:Renderer) -> IndexContext:
     else:
       # define indexes for GPU-like execution
       idxs = get_grouped_dims("gidx", full_shape[:global_dims], opts.global_max, reverse=True) + \
-             get_grouped_dims("lidx", full_shape[global_dims:first_reduce+group_for_reduces], opts.local_max)
+             get_grouped_dims("lidx", full_shape[global_dims:first_scan+group_for_scans], opts.local_max)
   else:
     # all loops are RANGES
     idxs = [UOp(Ops.RANGE, dtypes.int, (UOp.const(dtypes.int, 0), variable_to_uop(g)), (i, False))
-                  for i,g in enumerate(full_shape[:first_reduce])]
+                  for i,g in enumerate(full_shape[:first_scan])]
 
-  # reduce loops
+  # scan loops
   idxs += [UOp(Ops.RANGE, dtypes.int, (UOp.const(dtypes.int, 0), variable_to_uop(g)), (i, True))
-    for i,g in enumerate(full_shape[first_reduce+group_for_reduces:first_upcasted], start=first_reduce+group_for_reduces)]
+    for i,g in enumerate(full_shape[first_scan+group_for_scans:first_upcasted], start=first_scan+group_for_scans)]
 
   # upcast loops
   for i,g in enumerate(full_shape[first_upcasted:], start=first_upcasted):
     assert isinstance(g, int), "needs to be int to upcast/unroll"
     idxs.append(UOp(Ops.EXPAND, dtypes.int, (UOp.const(dtypes.int.vec(g), tuple(range(g))),), ((i,g),)))
 
-  # late indexes (group for reduce)
-  ridxs = idxs[:]
-  for a in range(first_reduce, first_reduce+group_for_reduces):
-    ridxs[a] = UOp(Ops.RANGE, dtypes.int, (UOp.const(dtypes.int, 0), variable_to_uop(full_shape[a])), (1000+a, True))
+  # late indexes (group for scans)
+  sidxs = idxs[:]
+  for a in range(first_scan, first_scan+group_for_scans):
+    sidxs[a] = UOp(Ops.RANGE, dtypes.int, (UOp.const(dtypes.int, 0), variable_to_uop(full_shape[a])), (1000+a, True))
 
-  return IndexContext(idxs, ridxs)
+  return IndexContext(idxs, sidxs)
 
 # ***** lowering (given index) *****
 
-def lower_reduce_axis(ctx: IndexContext, x: UOp):
-  # NOTE: always using ridxs is fine here
-  reduce_range, reduce_expand = partition([ctx.ridxs[i] for i in x.axis_arg], lambda y: y.op is Ops.RANGE)
-  assert all(x.op is Ops.EXPAND for x in reduce_expand), f"not all EXPANDS in {reduce_expand} for {x.axis_arg}"
+def lower_scan_axis(ctx: IndexContext, x: UOp):
+  # NOTE: always using sidxs is fine here
+  scan_range, scan_expand = partition([ctx.sidxs[i] for i in x.axis_arg], lambda y: y.op is Ops.RANGE)
+  assert all(x.op is Ops.EXPAND for x in scan_expand), f"not all EXPANDS in {scan_expand} for {x.axis_arg}"
   alu_op: Ops = x.arg[0]
+  only_reduce: bool = x.arg[2]
   ret = x.src[0]
-  if len(contract_axis:=flatten(x.arg for x in reduce_expand)):
+  if len(contract_axis:=flatten(x.arg for x in scan_expand)):
     ret = UOp(Ops.CONTRACT, x.dtype.vec(prod(x[1] for x in contract_axis)), (ret,), tuple(contract_axis))
-    ret = functools.reduce(lambda x,y: x.alu(alu_op, y), [ret.gep(i) for i in range(ret.dtype.count)])
-  if not len(reduce_range): return ret
-  # create ACC and assign
-  acc = UOp(Ops.DEFINE_ACC, x.dtype, (x.const_like(identity_element(alu_op, x.dtype.scalar())),) + tuple(reduce_range), (ctx.acc_num,))
-  ctx.acc_num += 1
-  return acc.assign(acc.alu(alu_op, ret))
+    if not only_reduce:
+      ret_src = [functools.reduce(lambda x,y: x.alu(alu_op, y), [ret.gep(i) for i in range(j + 1)]) for j in range(ret.dtype.count)]
+      ret = UOp(Ops.VECTORIZE, ret.dtype, tuple(ret_src), tuple(contract_axis))
+    else: ret = functools.reduce(lambda x,y: x.alu(alu_op, y), [ret.gep(i) for i in range(ret.dtype.count)])
+  if scan_range:
+    # create ACC and assign
+    acc = UOp(Ops.DEFINE_ACC, ret.dtype, (ret.const_like(identity_element(alu_op, ret.dtype.scalar())),) + tuple(scan_range), (ctx.acc_num, only_reduce))
+    ctx.acc_num += 1
+    ret = UOp(Ops.ASSIGN, ret.dtype, (acc, ret.alu(alu_op, acc.gep(ret.dtype.count-1).broadcast(ret.dtype.count))))
+  return UOp(Ops.EXPAND, ret.dtype.scalar(), (ret,), tuple(contract_axis)) if ret.dtype.count > 1 else ret
 
 def lower_load_store(ctx: IndexContext, x: UOp):
-  idx, valid = x.st_arg.to_indexed_uops(ctx.ridxs if x.op is Ops.LOAD and x.src[0].op is Ops.DEFINE_LOCAL else ctx.idxs)
+  idx, valid = x.st_arg.to_indexed_uops(ctx.sidxs if x.op is Ops.LOAD and x.src[0].op is Ops.DEFINE_LOCAL else ctx.idxs)
   # TODO: check has_valid in UPat, not here
   has_valid = valid.op is not Ops.CONST or valid.arg is not True
   buf = x.src[0]
@@ -128,13 +131,13 @@ def lower_load_store(ctx: IndexContext, x: UOp):
   # NOTE: If we're storing the reduced value back into each thread, need to zero-out the reduced axes
   if store_back: idx, _ = x.st_arg.to_indexed_uops([u.const_like(0) if u in x.src[2].src else u for u in ctx.idxs])
   if (not cast(PtrDType, x.src[0].dtype).local) or store_back:
-    for oidx, ridx in zip(ctx.idxs, ctx.ridxs):
+    for oidx, ridx in zip(ctx.idxs, ctx.sidxs):
       if oidx is not ridx: valid = valid * oidx.eq(0)
     has_valid = valid.op is not Ops.CONST or valid.arg is not True
   return UOp(Ops.STORE, dtypes.void, (buf.index(idx, valid if has_valid else None), x.src[2]))
 
 pm_lowerer = PatternMatcher([
-  (UPat(Ops.REDUCE_AXIS, name="x"), lower_reduce_axis),
+  (UPat(Ops.SCAN_AXIS, name="x"), lower_scan_axis),
   (UPat(Ops.VALID, src=(UPat(Ops.VIEW),), name="x"), lambda ctx,x: x.st_arg.to_indexed_uops(ctx.idxs)[1]),
   # rewrite LOAD/STORE VIEW to LOAD/STORE with indexed
   (UPat((Ops.LOAD, Ops.STORE), src=(UPat(), UPat(Ops.VIEW)), allow_any_len=True, name="x"), lower_load_store),

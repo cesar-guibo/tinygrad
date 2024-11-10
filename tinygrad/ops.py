@@ -119,11 +119,14 @@ class Ops(FastEnum):
   SPECIAL = auto()
   NOOP = auto()
 
-  # reduce
-  REDUCE_AXIS = auto()
+  # scan
+  SCAN_AXIS = auto()
 
   # ReduceOps
   SUM = auto(); PROD = auto(); REDUCE_MAX = auto() # noqa: E702
+  
+  # ScanOps
+  CUM_SUM = auto()
 
   # helper ops
   GEP = auto()
@@ -173,6 +176,7 @@ class GroupOp:
   ALU = set.union(Unary, Binary, Ternary)
 
   Reduce = {Ops.SUM, Ops.PROD, Ops.REDUCE_MAX}
+  Scan = {Ops.CUM_SUM}
   Irreducible = {Ops.CONST, Ops.DEFINE_VAR, Ops.SPECIAL, Ops.RANGE}
 
   # meta ops
@@ -186,9 +190,10 @@ class GroupOp:
   UnsafePad = {Ops.RECIP, Ops.LOG2, Ops.EXP2, Ops.IDIV}
 
 # TODO: remove this?
-UnaryOps = BinaryOps = ReduceOps = MetaOps = TernaryOps = Ops
+UnaryOps = BinaryOps = ScanOps = ReduceOps = MetaOps = TernaryOps = Ops
 
 REDUCE_ALU: Dict[Ops, Ops] = {ReduceOps.SUM:BinaryOps.ADD, ReduceOps.PROD:BinaryOps.MUL, ReduceOps.REDUCE_MAX:BinaryOps.MAX}
+SCAN_ALU: Dict[Ops, Ops] = {ScanOps.CUM_SUM:BinaryOps.ADD}
 
 # https://en.wikipedia.org/wiki/Identity_element
 def identity_element(op:Ops, dt:DType): return dtypes.as_const({BinaryOps.ADD:0, BinaryOps.MUL:1, BinaryOps.MAX:dtypes.min(dt)}[op], dt)
@@ -248,7 +253,7 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
   def key(self) -> bytes:
     return hashlib.sha256(str((self.op, self.dtype, self.arg)).encode() + b"".join([s.key for s in self.src])).digest()
   def __repr__(self): return pretty_print(self, lambda x: f"{type(self).__name__}({x.op}, {x.dtype}, arg={x.argstr()}, src=(%s))")
-  def argstr(self): return f'({", ".join(map(str, self.arg))})' if self.op is Ops.REDUCE_AXIS else self.arg
+  def argstr(self): return f'({", ".join(map(str, self.arg))})' if self.op is Ops.SCAN_AXIS else self.arg
   @functools.cached_property
   def parents(self) -> Dict[UOp, None]: return {**{x:None for x in self.src}, **{k:None for x in self.src for k in x.parents}}
   @functools.cached_property  # parents with self
@@ -270,7 +275,7 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
     src_sts = [x.st for x in self.src if x.st is not None]
     assert all_same([x.shape for x in src_sts]), f"UOp parents must have the same shape {self} {[x.shape for x in src_sts]}"
     from tinygrad.shape.shapetracker import ShapeTracker
-    return ShapeTracker.from_shape(src_sts[0].reduce(self.axis_arg)) if self.op is Ops.REDUCE_AXIS else src_sts[0]
+    return ShapeTracker.from_shape(src_sts[0].reduce(self.axis_arg)) if self.op is Ops.SCAN_AXIS and self.arg[2] else src_sts[0]
   @functools.cached_property
   def full_shape(self) -> Tuple[sint, ...]:
     return self.arg.shape if self.op is Ops.VIEW else tuple(smax(x) for x in zip(*[x.full_shape for x in self.src if x.has_st]))
@@ -304,8 +309,8 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
     return ret.arg
   @property
   def axis_arg(self) -> Tuple[int, ...]:
-    assert self.op in {Ops.REDUCE_AXIS, Ops.WMMA}, f"axis_arg called on {self.op}"
-    ret = self.arg[1] if self.op is Ops.REDUCE_AXIS else self.arg[7]
+    assert self.op in {Ops.SCAN_AXIS, Ops.WMMA}, f"axis_arg called on {self.op}"
+    ret = self.arg[1] if self.op is Ops.SCAN_AXIS else self.arg[7]
     assert isinstance(ret, tuple) and all(isinstance(x, int) for x in ret), f"axis_arg trying to return {ret}"
     return ret
   def sink(self, *srcs:UOp): return UOp(Ops.SINK, dtypes.void, (self,)+srcs)
@@ -315,7 +320,7 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
   def broadcast(self, count:int):
     assert self.dtype.count == 1
     if count == 1: return self
-    return UOp(Ops.VECTORIZE, self.dtype.vec(count), (self,)*count)
+    return UOp(Ops.VECTORIZE, self.dtype.vec(count), (self,)*count, tuple())
   def cast(self, dtype:DType): return UOp(Ops.CAST, dtype, (self,))
   def bitcast(self, dtype:DType): return UOp(Ops.BITCAST, dtype, (self,))
   def gep(self, i:Union[Tuple[int, ...], int]):
@@ -343,7 +348,8 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
   def range(dtype:DType, start:ConstType|UOp, end:ConstType|UOp, idx:int):
     return UOp(Ops.RANGE, dtype=dtype, src=(UOp.const(dtype, start) if not isinstance(start, UOp) else start,
                                              UOp.const(dtype, end) if not isinstance(end, UOp) else end), arg=(idx, False))
-  def r(self, op, axis): return UOp(Ops.REDUCE_AXIS, self.dtype, (self,), (REDUCE_ALU[op] if op in GroupOp.Reduce else op, axis))
+  def s(self, op, axis, only_reduce:bool=False): return UOp(Ops.SCAN_AXIS, self.dtype, (self,), (SCAN_ALU[op] if op in GroupOp.Scan else REDUCE_ALU[op], axis, only_reduce))
+  def r(self, op, axis): return self.s(op, axis, only_reduce=True)
   def assign(self, x:UOp): return UOp(Ops.ASSIGN, self.dtype, (self,x))
 
   # *** uop Variable stuff ***
@@ -445,6 +451,8 @@ class KernelInfo:
   local_dims: int = 0           # number of local dimensions  (this is remapping RANGE to SPECIAL)
   upcasted: int = 0             # count that are upcasted     (this is remapping RANGE to EXPAND)
   dont_use_locals: bool = False # don't use local indexing
+  firs_scan: int = 0
+  group_for_scans: int = 0
 
 # ***** ops in python *****
 
@@ -761,7 +769,7 @@ spec = PatternMatcher([
 
   # early LOAD has a <buf, shapetracker, store?>
   (UPat(Ops.LOAD, src=(UPat((Ops.DEFINE_GLOBAL, Ops.DEFINE_LOCAL)), UPat(Ops.VIEW))), lambda: True),
-  (UPat(Ops.LOAD, src=(UPat((Ops.DEFINE_GLOBAL, Ops.DEFINE_LOCAL)), UPat(Ops.VIEW), UPat(Ops.STORE))), lambda: True),
+  (UPat(Ops.LOAD, src=(UPat((Ops.DEFINE_GLOBAL, Ops.DEFINE_LOCAL)), UPat(Ops.VIEW), UPat((Ops.STORE, Ops.SINK)))), lambda: True),
 
   # early STORE has a <buf, shapetracker, val>
   (UPat(Ops.STORE, src=(UPat((Ops.DEFINE_GLOBAL, Ops.DEFINE_LOCAL)), UPat(Ops.VIEW), UPat())), lambda: True),
@@ -775,6 +783,7 @@ spec = PatternMatcher([
   (UPat(Ops.LOAD, src=(UPat((Ops.INDEX, Ops.CAST)),)), lambda: True),
   (UPat(Ops.LOAD, src=(UPat((Ops.INDEX, Ops.CAST)), UPat((Ops.IF, Ops.BARRIER)))), lambda: True),
   (UPat(Ops.LOAD, src=(UPat((Ops.INDEX, Ops.CAST)), UPat(name="alt"), UPat(dtype=dtypes.bool)), name="ld"), lambda ld,alt: ld.dtype == alt.dtype),
+  (UPat(Ops.LOAD, src=(UPat((Ops.INDEX, Ops.CAST)), UPat(name="alt"), UPat(dtype=dtypes.bool), UPat((Ops.IF, Ops.BARRIER))), name="ld"), lambda ld,alt: ld.dtype == alt.dtype),
 
   # STORE takes a <bufidx, val, gate?>
   (UPat(Ops.STORE, dtype=dtypes.void, src=(UPat((Ops.INDEX, Ops.CAST)), UPat())), lambda: True),
@@ -802,7 +811,7 @@ spec = PatternMatcher([
   (UPat(Ops.IF, dtype=dtypes.void, src=(UPat(), UPat(Ops.BARRIER))), lambda: True),
   (UPat(Ops.ENDIF, dtype=dtypes.void, src=(UPat(Ops.IF),)), lambda: True),
 
-  (UPat(Ops.REDUCE_AXIS, name="x"), lambda x: isinstance(x.arg, tuple) and len(x.arg) == 2 and x.arg[0] in REDUCE_ALU.values()),
+  (UPat(Ops.SCAN_AXIS, name="x"), lambda x: isinstance(x.arg, tuple) and len(x.arg) == 3 and x.arg[0] in REDUCE_ALU.values()),
   (UPat(Ops.GEP, src=(UPat(name="src"),), name="gep"), lambda gep,src: gep.dtype == src.dtype.scalar()),
   (UPat(Ops.VECTORIZE, name="x"), lambda x: len(x.src)>1 and len(x.src) == x.dtype.count and all(x.dtype == y.dtype.vec(len(x.src)) for y in x.src)),
   (UPat((Ops.BITCAST, Ops.CAST), src=(UPat(),), name="x"), lambda x: x.arg is None),
